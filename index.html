@@ -15,14 +15,15 @@
 <div class="screen" id="screen-home">
   <div class="title-wrap">
     <h1 class="game-title">ROAD RUSH</h1>
-    <div class="subtitle">2D hill-climb racer — solo or live multiplayer (up to 20)</div>
+    <div class="subtitle">Physics racing — solo or live multiplayer (up to 4)</div>
   </div>
   <div class="menu-col">
     <button class="btn btn-race" id="btnPlay">PLAY</button>
-    <button class="btn" id="btnVehicle">VEHICLE</button>
+    <button class="btn" id="btnVehicle">GARAGE</button>
     <button class="btn" id="btnMap">ROAD</button>
-    <button class="btn" id="btnMulti">MULTIPLAYER</button>
+    <button class="btn" id="btnHowTo">HOW TO PLAY</button>
     <button class="btn" id="btnSettings">SETTINGS</button>
+    <button class="btn" id="btnFeedback">FEEDBACK</button>
   </div>
   <div class="footer-note" id="homeStats"></div>
 </div>
@@ -31,18 +32,19 @@
 <div class="screen hidden" id="screen-play">
   <div class="screen-title">CHOOSE MODE</div>
   <div class="menu-col">
-    <input class="text-input small" id="inpName" maxlength="12" placeholder="Your name">
-    <button class="btn btn-primary" id="btnSingle">SINGLE PLAYER</button>
+    <input class="text-input small" id="inpName" maxlength="16" placeholder="Your name" autocomplete="off">
+    <div class="field-hint" id="nameHint">2–16 characters</div>
+    <button class="btn btn-primary" id="btnSingle">PLAY SOLO</button>
     <button class="btn" id="btnCreate">CREATE ROOM</button>
-    <button class="btn" id="btnJoinMenu">JOIN RACE</button>
+    <button class="btn" id="btnJoinMenu">JOIN ROOM</button>
     <button class="btn btn-back" id="btnPlayBack">BACK</button>
   </div>
   <div class="status-text" id="playStatus"></div>
 </div>
 
-<!-- ============ VEHICLE / MAP ============ -->
+<!-- ============ GARAGE / MAP ============ -->
 <div class="screen hidden" id="screen-vehicle">
-  <div class="screen-title">SELECT VEHICLE</div>
+  <div class="screen-title">GARAGE</div>
   <div class="vehicle-grid" id="vehicleGrid"></div>
   <button class="btn btn-back btn-small" id="btnVehicleBack">BACK</button>
 </div>
@@ -52,11 +54,71 @@
   <button class="btn btn-back btn-small" id="btnMapBack">BACK</button>
 </div>
 
+<!-- ============ HOW TO PLAY ============ -->
+<div class="screen hidden" id="screen-howto">
+  <div class="screen-title">HOW TO PLAY</div>
+  <div class="howto">
+    <h3>Goal</h3>
+    <p>Race left-to-right to the FINISH flag. Fuel drains while you accelerate —
+       grab fuel cans (they fill the tank to FULL). Nitro cans add one charge (max 3).
+       Press JUMP to hop over rocks, traffic and cacti.</p>
+    <h3>Controls — desktop</h3>
+    <table class="ctrl-table">
+      <tr><td>W / &#8593; / Num 8</td><td>Gas</td></tr>
+      <tr><td>S / &#8595; / Num 2</td><td>Brake / reverse</td></tr>
+      <tr><td>A / D or Num 4 / 6</td><td>Tilt mid-air</td></tr>
+      <tr><td>Space</td><td>Nitro</td></tr>
+      <tr><td>J</td><td>Jump</td></tr>
+      <tr><td>Esc</td><td>Pause (solo)</td></tr>
+    </table>
+    <h3>Controls — mobile</h3>
+    <p>GAS + BRAKE on the left · NOS + JUMP on the right · tilt &#9664;&#9654; in the middle.
+       Landscape required for racing.</p>
+    <h3>Multiplayer</h3>
+    <p>Create Room → share the QR / link / 6-character code → friends join (password
+       optional) → host picks the road, everyone picks a vehicle → START RACE.
+       The host's device is the referee: positions, pickups, the race start and
+       results are validated there. If you drop connection you have 30 seconds
+       to reconnect with your progress preserved.</p>
+    <h3>Scoring</h3>
+    <p>distance&#215;10 + coins&#215;10 + fuel&#215;2 + place bonus (1000/700/400).</p>
+  </div>
+  <button class="btn btn-back btn-small" id="btnHowToBack">BACK</button>
+</div>
+
+<!-- ============ FEEDBACK ============ -->
+<div class="screen hidden" id="screen-feedback">
+  <div class="screen-title">FEEDBACK</div>
+  <div class="menu-col" style="width:min(440px,92vw)">
+    <label class="fb-label">Category</label>
+    <select id="fbCategory" class="fb-select">
+      <option>BUG</option><option>GAMEPLAY</option><option>UI/UX</option>
+      <option>NETWORK</option><option>PERFORMANCE</option><option>SECURITY</option>
+      <option>SUGGESTION</option><option>OTHER</option>
+    </select>
+    <label class="fb-label">Rating</label>
+    <select id="fbRating" class="fb-select">
+      <option value="5">5 — Excellent</option><option value="4">4 — Good</option>
+      <option value="3" selected>3 — Okay</option><option value="2">2 — Poor</option>
+      <option value="1">1 — Bad</option>
+    </select>
+    <label class="fb-label">Message (10–1000 characters)</label>
+    <textarea id="fbMsg" class="fb-text" maxlength="1000" rows="5" placeholder="What happened? What should change?"></textarea>
+    <label class="fb-label">Contact (optional)</label>
+    <input id="fbContact" class="text-input small" style="width:100%" maxlength="60" placeholder="Email or handle">
+    <button class="btn btn-primary" id="btnFbSubmit">PREPARE FEEDBACK EMAIL</button>
+    <button class="btn btn-small" id="btnFbCopy">COPY TEXT INSTEAD</button>
+    <div class="status-text" id="fbStatus"></div>
+    <button class="btn btn-back btn-small" id="btnFbBack">BACK</button>
+  </div>
+</div>
+
 <!-- ============ JOIN ============ -->
 <div class="screen hidden" id="screen-join">
-  <div class="screen-title">JOIN RACE</div>
+  <div class="screen-title">JOIN ROOM</div>
   <div class="menu-col">
-    <input class="text-input" id="inpRoomCode" maxlength="5" placeholder="ROOM CODE" autocomplete="off">
+    <input class="text-input" id="inpRoomCode" maxlength="6" placeholder="ROOM CODE" autocomplete="off">
+    <input class="text-input small" id="inpRoomPass" style="width:100%;text-align:center;letter-spacing:1px" type="password" maxlength="24" placeholder="Password (if the room has one)">
     <button class="btn btn-primary" id="btnJoinConnect">CONNECT</button>
     <button class="btn btn-back" id="btnJoinBack">BACK</button>
   </div>
@@ -68,13 +130,23 @@
 <div class="screen hidden" id="screen-lobby">
   <div class="room-code-box" id="roomCodeBox">
     <div class="room-code-label">ROOM CODE</div>
-    <div class="room-code" id="roomCode">-----</div>
+    <div class="room-code" id="roomCode">------</div>
   </div>
   <div class="invite-row" id="inviteRow">
     <button class="btn btn-small" id="btnCopyLink">COPY LINK</button>
     <button class="btn btn-small" id="btnShowQr">QR CODE</button>
   </div>
+  <div class="lobby-badges" id="lobbyBadges"></div>
   <div class="status-text" id="lobbyStatus"></div>
+  <div class="menu-col roomtools hidden" id="roomTools">
+    <div class="setting-row">
+      <span>Room settings (host)</span>
+      <span>
+        <button class="btn btn-small" id="btnSetPass">PASSWORD</button>
+        <button class="btn btn-small" id="btnLockToggle">LOCK</button>
+      </span>
+    </div>
+  </div>
   <div class="lobby-cols">
     <div class="lobby-panel">
       <div class="panel-label">Players <span id="playerCount"></span></div>
@@ -91,6 +163,18 @@
       <div class="map-select" id="lobbyVehicle"></div>
     </div>
   </div>
+  <div class="chat-panel" id="chatPanel">
+    <div class="chat-head">
+      <span class="panel-label">CHAT</span>
+      <button class="btn btn-small" id="btnChatToggle" style="margin:0">&#9660;</button>
+    </div>
+    <div class="chat-log" id="chatLog"></div>
+    <div class="emote-row" id="emoteRow"></div>
+    <div class="chat-input-row">
+      <input class="text-input small" id="chatInput" style="flex:1;width:auto" maxlength="200" placeholder="Message…">
+      <button class="btn btn-small" id="btnChatSend" style="margin:0">SEND</button>
+    </div>
+  </div>
   <div class="menu-col" style="margin-top:14px">
     <button class="btn btn-race hidden" id="btnStartRace">START RACE</button>
     <button class="btn btn-back" id="btnLeaveLobby">LEAVE</button>
@@ -103,7 +187,12 @@
   <div class="menu-col">
     <div class="setting-row"><span>Music</span><button class="btn btn-small" id="btnMusicToggle">ON</button></div>
     <div class="setting-row"><span>Sound effects</span><button class="btn btn-small" id="btnSoundToggle">ON</button></div>
+    <div class="setting-row"><span>Graphics quality</span><button class="btn btn-small" id="btnQuality">AUTO</button></div>
+    <div class="setting-row"><span>Vibration</span><button class="btn btn-small" id="btnVibToggle">ON</button></div>
+    <div class="setting-row"><span>Reduced motion</span><button class="btn btn-small" id="btnMotionToggle">OFF</button></div>
     <div class="setting-row"><span>On-screen pedals</span><button class="btn btn-small" id="btnPedalsToggle">OFF</button></div>
+    <div class="setting-row"><span>Pedal size <input type="range" id="pedalSize" min="80" max="130" value="100"></span></div>
+    <div class="setting-row"><span>Pedal opacity <input type="range" id="pedalOpacity" min="50" max="100" value="90"></span></div>
     <div class="setting-row"><span>Best score</span><span class="stat-val" id="settingsBest">0</span></div>
     <div class="setting-row"><span>Total coins</span><span class="stat-val" id="settingsCoins">0</span></div>
     <button class="btn btn-small" id="btnResetSave">RESET PROGRESS</button>
@@ -119,6 +208,7 @@
     <div class="hud-top">
       <span class="hud-chip" id="hudPos">1st</span>
       <span class="hud-chip" id="hudSpeed">0 km/h</span>
+      <span class="hud-chip hud-conn" id="connChip">ONLINE</span>
       <span class="hud-right hud-chip" id="hudTime">0:00</span>
     </div>
     <div class="hud-fuel-row">
@@ -137,12 +227,16 @@
     <div class="hud-warning" id="hudWarning"></div>
   </div>
 
+  <div class="ping-chip" id="pingChip">PING —</div>
   <div class="race-list hidden" id="raceList"></div>
 
   <button class="icon-btn pause-btn" id="btnPause">II</button>
+  <button class="icon-btn emote-btn" id="btnEmote">&#128172;</button>
+
+  <div class="emote-panel hidden" id="emotePanel"></div>
+
   <div class="countdown-overlay hidden" id="countdownOverlay"><div class="countdown-num" id="countdownNum">3</div></div>
 
-  <!-- DESKTOP: key hints (WASD + arrows + numpad 8/4/6/2) -->
   <div class="key-hints" id="keyHints">
     <span class="kh"><kbd>W</kbd><kbd>&#8593;</kbd><kbd>8</kbd> Gas</span>
     <span class="kh"><kbd>S</kbd><kbd>&#8595;</kbd><kbd>2</kbd> Brake</span>
@@ -153,7 +247,6 @@
     <span class="kh"><kbd>R</kbd> Restart</span>
   </div>
 
-  <!-- MOBILE: GAS+BRAKE left cluster, tilt center, NOS+JUMP right cluster -->
   <div class="mobile-controls hidden" id="touchControls">
     <div class="mc-cluster">
       <button class="pedal pedal-brake" id="btnBrake">BRAKE</button>
@@ -168,6 +261,8 @@
       <button class="pedal pedal-jump" id="btnJump">JUMP</button>
     </div>
   </div>
+
+  <div class="debug-panel hidden" id="debugPanel"></div>
 </div>
 
 <!-- ============ OVERLAYS ============ -->
@@ -198,7 +293,7 @@
 <div class="overlay hidden" id="overlay-qr">
   <div class="big-label" style="font-size:22px">SCAN TO JOIN</div>
   <div class="qr-box" id="qrBox"></div>
-  <div class="room-code" id="qrCodeText">-----</div>
+  <div class="room-code" id="qrCodeText">------</div>
   <div class="sub-label qr-link" id="qrUrl"></div>
   <button class="btn btn-back btn-small" id="btnQrClose">CLOSE</button>
 </div>
