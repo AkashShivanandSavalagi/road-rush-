@@ -16,6 +16,9 @@ const RACE_TIMEOUT = 240;
 const START_X = 120;
 const JUMP_HEIGHT = 90;
 const JUMP_COOLDOWN = 1.2;
+const JUMP_BUFFER = 0.2;
+const MAX_RECENT_HISTORY = 12;
+const NET_MAX_SPEED_FACTOR = 1.8;
 
 /* STUN + TURN: TURN relays traffic when direct P2P is blocked (carrier NATs etc). */
 const PEER_OPTS = {
@@ -86,8 +89,8 @@ const VEHICLES = {
 };
 
 /* ------------------------------ save ------------------------------ */
-const SAVE_KEY = "roadrush_save_v2";
-const save = { name: "Player", vehicle: "Car", map: "Highway", sound: true, music: true, pedals: false, best: 0, coins: 0 };
+const SAVE_KEY = "roadrush_save_v3";
+const save = { name: "Player", vehicle: "Car", map: "Highway", sound: true, music: true, pedals: false, best: 0, coins: 0, history: [] };
 function loadSave() {
   try {
     const obj = JSON.parse(localStorage.getItem(SAVE_KEY));
@@ -100,6 +103,11 @@ function loadSave() {
     if (typeof obj.pedals === "boolean") save.pedals = obj.pedals;
     if (typeof obj.best === "number" && isFinite(obj.best)) save.best = Math.max(0, Math.floor(obj.best));
     if (typeof obj.coins === "number" && isFinite(obj.coins)) save.coins = Math.max(0, Math.floor(obj.coins));
+    if (Array.isArray(obj.history)) {
+      save.history = obj.history
+        .filter(h => h && typeof h === "object" && typeof h.mode === "string")
+        .slice(0, MAX_RECENT_HISTORY);
+    }
   } catch (e) {}
 }
 function persist() { try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch (e) {} }
@@ -257,6 +265,7 @@ class RacePlayer {
     this.vx = 0; this.vy = 0;
     this.angle = 0; this.angVel = 0;
     this.onGround = true; this.airtime = 0; this.jumpCd = 0;
+    this.jumpBuffer = 0;
     this.fuel = this.fuelCap;
     this.nitroCharges = 0; this.maxNitro = 3; this.nitroTimer = 0;
     this.coins = 0; this.distance = 0;
@@ -287,16 +296,19 @@ class RacePlayer {
     let { accel, brake, left, right, nitro, jump } = input;
     if (!raceStarted) { accel = brake = left = right = nitro = jump = false; }
     if (this.jumpCd > 0) this.jumpCd -= dt;
+    if (jump && raceStarted) this.jumpBuffer = JUMP_BUFFER;
+    else this.jumpBuffer = Math.max(0, this.jumpBuffer - dt);
 
     if (nitro && raceStarted) this.useNitro(particles, sfx);
     if (this.nitroTimer > 0) this.nitroTimer -= dt;
     const nitroBoost = this.nitroTimer > 0 ? 1.55 : 1.0;
 
     // JUMP: vy = sqrt(2·g·h) gives the same hop height on every map.
-    if (jump && raceStarted && this.onGround && this.stunned <= 0 && this.jumpCd <= 0) {
+    if (this.jumpBuffer > 0 && raceStarted && this.onGround && this.stunned <= 0 && this.jumpCd <= 0) {
       this.vy = -Math.sqrt(2 * gravity * JUMP_HEIGHT);
       this.onGround = false;
       this.jumpCd = JUMP_COOLDOWN;
+      this.jumpBuffer = 0;
       if (sfx) sfx.play("jump");
       particles.emit(this.x, this.y + this.h / 2, 8, t.def.dust,
         { spread: 70, speed: 110, life: 0.35, size: 2, gravity: 500 });
@@ -391,6 +403,26 @@ function computeScore(distanceM, coins, place, fuelRemaining) {
   else if (place && place > 3) s += Math.max(0, 200 - (place - 4) * 20);
   return Math.round(s);
 }
+function finiteNum(v, fallback = 0) { return (typeof v === "number" && isFinite(v)) ? v : fallback; }
+function recordRaceHistory(mode, title, entry) {
+  if (!entry) return;
+  const item = {
+    at: Date.now(),
+    mode,
+    title: title || "Race",
+    map: Game.mapName || save.map,
+    vehicle: save.vehicle,
+    place: finiteNum(entry.place, 0),
+    score: Math.round(finiteNum(entry.score, 0)),
+    time: entry.time != null ? Math.round(finiteNum(entry.time, 0) * 1000) / 1000 : null,
+    distance: Math.round(finiteNum(entry.distance, 0)),
+    coins: Math.max(0, Math.floor(finiteNum(entry.coins, 0))),
+    fuel: Math.max(0, Math.floor(finiteNum(entry.fuel, 0))),
+  };
+  save.history.unshift(item);
+  if (save.history.length > MAX_RECENT_HISTORY) save.history.length = MAX_RECENT_HISTORY;
+  persist();
+}
 
 /* ------------------------------ networking (20 players, TURN, ping, retry) ------------------------------ */
 class NetManager {
@@ -481,6 +513,29 @@ class NetManager {
       if (this.onError) this.onError("A player left the room.");
     }
   }
+  _sanitizeState(playerId, raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const v = VEHICLES[(this.players.get(playerId) || {}).vehicle || "Car"] || VEHICLES.Car;
+    const maxVx = v.maxSpeed * NET_MAX_SPEED_FACTOR;
+    return {
+      id: String(playerId || "").slice(0, 40),
+      x: clamp(finiteNum(raw.x), 0, START_X + FINISH_DISTANCE + 1500),
+      y: clamp(finiteNum(raw.y), -500, 1400),
+      a: clamp(finiteNum(raw.a), -180, 180),
+      vx: clamp(finiteNum(raw.vx), -maxVx, maxVx),
+      n: !!raw.n,
+      f: !!raw.f,
+      d: clamp(finiteNum(raw.d), 0, FINISH_DISTANCE + 1000),
+    };
+  }
+  _sanitizeFinish(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const time = clamp(finiteNum(raw.time, RACE_TIMEOUT + 1), 0, RACE_TIMEOUT + 90);
+    const distance = clamp(Math.round(finiteNum(raw.distance)), 0, Math.round(FINISH_DISTANCE * UNIT_TO_M) + 500);
+    const coins = clamp(Math.floor(finiteNum(raw.coins)), 0, 999);
+    const fuel = clamp(Math.floor(finiteNum(raw.fuel)), 0, 999);
+    return { time, distance, coins, fuel };
+  }
   _handleGuestMessage(conn, data) {
     if (!data || !data.t) return;
     switch (data.t) {
@@ -504,12 +559,19 @@ class NetManager {
         break;
       }
       case "state":
-        this.lastStates.set(conn.peer, data.s);
-        if (this.onWorldUpdate) this.onWorldUpdate(conn.peer, data.s);
-        this.broadcast({ t: "peerstate", id: conn.peer, s: data.s }, conn.peer);
+        {
+          const safe = this._sanitizeState(conn.peer, data.s);
+          if (!safe) break;
+          this.lastStates.set(conn.peer, safe);
+          if (this.onWorldUpdate) this.onWorldUpdate(conn.peer, safe);
+          this.broadcast({ t: "peerstate", id: conn.peer, s: safe }, conn.peer);
+        }
         break;
       case "finish":
-        if (this._onGuestFinish) this._onGuestFinish(conn.peer, data);
+        {
+          const safe = this._sanitizeFinish(data);
+          if (safe && this._onGuestFinish) this._onGuestFinish(conn.peer, safe);
+        }
         break;
       case "pong": {
         if (typeof data.ts !== "number") break;
@@ -625,14 +687,14 @@ class NetManager {
         ok: () => { if (!settle.done) { settle.done = true; clearTimeout(settle.to); resolve(code.trim().toUpperCase()); } },
         err: (m) => { if (!settle.done) { settle.done = true; clearTimeout(settle.to); reject(new Error(m)); } },
       };
-      settle.to = setTimeout(() => settle.err("timeout"), 10000);
+      settle.to = setTimeout(() => settle.err("timeout"), 14000);
       this._joinSettle = settle;
       const retryNetwork = () => {
         if (settle.done || this._destroyed) return;
-        if (attempt < 1) {
+        if (attempt < 2) {
           settle.done = true; clearTimeout(settle.to);
           try { if (this.peer) this.peer.destroy(); } catch (e) {}
-          setTimeout(() => this._joinAttempt(code, attempt + 1).then(resolve, reject), 700);
+          setTimeout(() => this._joinAttempt(code, attempt + 1).then(resolve, reject), 700 + attempt * 500);
         } else settle.err("network");
       };
       try { this.peer = new Peer(undefined, PEER_OPTS); }
@@ -651,6 +713,7 @@ class NetManager {
         this.hostConn = conn;
         conn.on("open", () => conn.send({ t: "hello", name: this.myName, vehicle: save.vehicle }));
         conn.on("data", (data) => this._handleHostMessage(data));
+        conn.on("error", () => { if (!settle.done) retryNetwork(); });
         conn.on("close", () => {
           if (!settle.done) settle.err("closed");
           else if (this.onHostLeft) this.onHostLeft();
@@ -777,6 +840,12 @@ function drawScenery(ctx, terrain, camX, camY, W, H, mapName) {
       ctx.fillStyle = "#a08250"; ctx.beginPath(); ctx.arc(sx, gy - 6, 8 + h2 * 6, 0, 6.283); ctx.fill();
     } else if (mapName === "Moon") {
       ctx.fillStyle = "#1c1c26"; ctx.beginPath(); ctx.ellipse(sx, gy + 4, 16 + h2 * 14, 5, 0, 0, 6.283); ctx.fill();
+    }
+    if (h1 > 0.63 && h1 < 0.71) {
+      ctx.fillStyle = "#2a2f3f"; ctx.fillRect(sx - 2, gy - 70, 4, 70);
+      ctx.fillStyle = "#f3d34a"; roundRect(ctx, sx - 28, gy - 92, 56, 26, 4); ctx.fill();
+      ctx.fillStyle = "#1a1e28"; ctx.font = "bold 10px sans-serif"; ctx.textAlign = "center";
+      ctx.fillText("COIN ZONE", sx, gy - 75);
     }
   }
 }
@@ -928,6 +997,7 @@ const input = { accel: false, brake: false, left: false, right: false };
 let nitroQueued = false, jumpQueued = false;
 let toastT = 0, toastMsg = "";
 let pendingRoom = null;
+let setupFlow = null;
 
 const Game = {
   mode: null, state: "menu", mapName: "Highway",
@@ -946,7 +1016,7 @@ const Game = {
 };
 
 const SCREENS = ["screen-home", "screen-play", "screen-vehicle", "screen-map",
-                 "screen-join", "screen-lobby", "screen-settings", "screen-race"];
+                 "screen-join", "screen-lobby", "screen-settings", "screen-history", "screen-race"];
 function showScreen(id) {
   for (const s of SCREENS) $(s).classList.add("hidden");
   if (id) $(id).classList.remove("hidden");
@@ -1185,6 +1255,7 @@ function endSingle(title) {
   const isBest = me && me.score > save.best;
   if (isBest) save.best = me.score;
   save.coins += me ? me.coins : 0;
+  recordRaceHistory("single", title, me);
   persist();
   presentLeaderboard(title,
     `You finished ${fmtPlace(me.place)}${me.time != null ? " — " + fmtTime(me.time) : ""}` +
@@ -1200,7 +1271,9 @@ function checkSingleRaceEnd(dt) {
 function hostHandleFinish(id, data) {
   if (!Game.net.raceRoster.includes(id)) return;
   if (Game.net.finishList.some(f => f.id === id)) return;
-  Game.net.finishList.push({ id, time: data.time, distance: data.distance, coins: data.coins, fuel: data.fuel });
+  const safe = Game.net._sanitizeFinish(data);
+  if (!safe) return;
+  Game.net.finishList.push({ id, time: safe.time, distance: safe.distance, coins: safe.coins, fuel: safe.fuel });
 }
 function checkHostRaceEnd(dt) {
   if (Game.state !== "racing" || Game.mode !== "host") return;
@@ -1511,6 +1584,8 @@ function goHome() {
   Game.paused = false;
   if (Game.net) { Game.net.destroy(); Game.net = null; }
   Game.mode = null;
+  setupFlow = null;
+  setFlowActionButtons();
   updateHomeStats();
   showScreen("screen-home");
 }
@@ -1605,6 +1680,7 @@ function setupNetCallbacks(net) {
     if (mine) {
       if (mine.score > save.best) save.best = mine.score;
       save.coins += (mine.coins || 0);
+      recordRaceHistory(net.isHost ? "host" : "guest", "RACE COMPLETE", mine);
       persist();
     }
     presentLeaderboard("RACE COMPLETE",
@@ -1622,6 +1698,8 @@ function setupNetCallbacks(net) {
     $("touchControls").classList.add("hidden");
     net.destroy();
     Game.net = null; Game.mode = null;
+    setupFlow = null;
+    setFlowActionButtons();
     updateHomeStats();
     showScreen("screen-play");
     $("playStatus").textContent = "The host left the room.";
@@ -1636,6 +1714,8 @@ function setupNetCallbacks(net) {
   net._onGuestFinish = (id, data) => hostHandleFinish(id, data);
 }
 function enterLobby() {
+  setupFlow = null;
+  setFlowActionButtons();
   showScreen("screen-lobby");
   const net = Game.net;
   const isHost = net.isHost;
@@ -1745,9 +1825,31 @@ function buildMapScreen() {
     grid.appendChild(card);
   }
 }
+function renderHistory() {
+  const list = $("historyList");
+  if (!list) return;
+  list.innerHTML = "";
+  if (!save.history.length) {
+    const li = document.createElement("li");
+    li.innerHTML = `<span class="lb-name">No races yet. Finish one race to save history.</span><span class="lb-detail">—</span>`;
+    list.appendChild(li);
+    return;
+  }
+  save.history.forEach((h, i) => {
+    const li = document.createElement("li");
+    const when = new Date(finiteNum(h.at, Date.now())).toLocaleString();
+    const rank = h.place ? fmtPlace(h.place) : "—";
+    const detail = `${h.map || "Road"} • ${h.vehicle || "Car"} • ${h.mode || "race"} • ${when}`;
+    const right = `${h.time != null ? fmtTime(h.time) : fmtDist(h.distance || 0)} • ${Math.round(h.score || 0).toLocaleString()} pts`;
+    li.innerHTML = `<span class="lb-place">#${i + 1}</span><span class="lb-name">${rank} • ${detail}</span><span class="lb-detail">${right}</span>`;
+    list.appendChild(li);
+  });
+}
 function updateHomeStats() {
+  const last = save.history[0];
+  const recent = last ? ` • Last: ${last.title} (${last.place ? fmtPlace(last.place) : "—"})` : "";
   $("homeStats").textContent =
-    `Best ${save.best.toLocaleString()} pts • ${save.coins.toLocaleString()} coins • ${save.vehicle} on ${save.map}`;
+    `Best ${save.best.toLocaleString()} pts • ${save.coins.toLocaleString()} coins • ${save.vehicle} on ${save.map}${recent}`;
 }
 function updateSettingsUI() {
   $("btnMusicToggle").textContent = save.music ? "ON" : "OFF";
@@ -1755,6 +1857,16 @@ function updateSettingsUI() {
   $("btnPedalsToggle").textContent = save.pedals ? "ON" : "OFF";
   $("settingsBest").textContent = save.best.toLocaleString();
   $("settingsCoins").textContent = save.coins.toLocaleString();
+}
+function setFlowActionButtons() {
+  $("btnMapContinue").classList.toggle("hidden", setupFlow !== "pre-race");
+  $("btnVehicleContinue").classList.toggle("hidden", setupFlow !== "pre-race");
+}
+function openPreRaceFlow() {
+  setupFlow = "pre-race";
+  buildMapScreen();
+  setFlowActionButtons();
+  showScreen("screen-map");
 }
 
 /* ------------------------------ input (WASD + arrows + NUMPAD 8/4/6/2) ------------------------------
@@ -1810,6 +1922,8 @@ function init() {
   Game.music.probeExternal(); // checks for an optional race-music.mp3
   buildVehicleScreen();
   buildMapScreen();
+  renderHistory();
+  setFlowActionButtons();
   updateHomeStats();
   updateSettingsUI();
   $("inpName").value = save.name;
@@ -1831,12 +1945,38 @@ function init() {
   bindPedal($("btnJump"), () => jumpQueued = true, null);
   bindPedal($("btnNitro"), () => nitroQueued = true, null);
 
-  $("btnPlay").onclick = () => { Game.sfx.play("click"); $("playStatus").textContent = ""; showScreen("screen-play"); };
-  $("btnMulti").onclick = () => { Game.sfx.play("click"); $("playStatus").textContent = ""; showScreen("screen-play"); };
-  $("btnVehicle").onclick = () => { Game.sfx.play("click"); buildVehicleScreen(); showScreen("screen-vehicle"); };
-  $("btnVehicleBack").onclick = () => { Game.sfx.play("click"); updateHomeStats(); showScreen("screen-home"); };
-  $("btnMap").onclick = () => { Game.sfx.play("click"); buildMapScreen(); showScreen("screen-map"); };
-  $("btnMapBack").onclick = () => { Game.sfx.play("click"); updateHomeStats(); showScreen("screen-home"); };
+  $("btnPlay").onclick = () => { Game.sfx.play("click"); $("playStatus").textContent = ""; openPreRaceFlow(); };
+  $("btnMulti").onclick = () => { Game.sfx.play("click"); setupFlow = null; setFlowActionButtons(); $("playStatus").textContent = ""; showScreen("screen-play"); };
+  $("btnVehicle").onclick = () => {
+    Game.sfx.play("click");
+    setupFlow = null;
+    setFlowActionButtons();
+    buildVehicleScreen();
+    showScreen("screen-vehicle");
+  };
+  $("btnVehicleBack").onclick = () => {
+    Game.sfx.play("click");
+    if (setupFlow === "pre-race") showScreen("screen-map");
+    else { updateHomeStats(); showScreen("screen-home"); }
+  };
+  $("btnVehicleContinue").onclick = () => {
+    Game.sfx.play("click");
+    setupFlow = null;
+    setFlowActionButtons();
+    $("playStatus").textContent = "";
+    showScreen("screen-play");
+  };
+  $("btnMap").onclick = () => {
+    Game.sfx.play("click");
+    setupFlow = null;
+    setFlowActionButtons();
+    buildMapScreen();
+    showScreen("screen-map");
+  };
+  $("btnMapBack").onclick = () => { Game.sfx.play("click"); setupFlow = null; setFlowActionButtons(); updateHomeStats(); showScreen("screen-home"); };
+  $("btnMapContinue").onclick = () => { Game.sfx.play("click"); buildVehicleScreen(); showScreen("screen-vehicle"); };
+  $("btnHistory").onclick = () => { Game.sfx.play("click"); renderHistory(); showScreen("screen-history"); };
+  $("btnHistoryBack").onclick = () => { Game.sfx.play("click"); updateHomeStats(); showScreen("screen-home"); };
   $("btnPlayBack").onclick = () => { Game.sfx.play("click"); updateHomeStats(); showScreen("screen-home"); };
   $("btnJoinMenu").onclick = () => {
     Game.sfx.play("click");
@@ -1871,7 +2011,7 @@ function init() {
     Game.sfx.play("click");
   };
   $("btnResetSave").onclick = () => {
-    save.best = 0; save.coins = 0;
+    save.best = 0; save.coins = 0; save.history = [];
     persist(); updateSettingsUI(); updateHomeStats();
     Game.sfx.play("click");
   };
@@ -1934,8 +2074,8 @@ function init() {
       const msg =
         e.message === "notfound" ? "Room not found — check the code, or the host may have left." :
         e.message === "full" ? "That room is full (20 players max)." :
-        e.message === "timeout" ? "Connection timed out — check both devices' internet and retry." :
-        e.message === "network" ? "Network blocked the connection — try again or a different Wi-Fi." :
+        e.message === "timeout" ? "Connection timed out — check both devices' internet, then retry or scan the host QR again." :
+        e.message === "network" ? "Network blocked the connection — try again, switch Wi-Fi/mobile data, or ask host to recreate room." :
         "Could not connect — check your internet.";
       $("joinStatus").textContent = "";
       $("joinError").textContent = msg;

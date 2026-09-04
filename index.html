@@ -21,6 +21,7 @@
     <button class="btn btn-race" id="btnPlay">PLAY</button>
     <button class="btn" id="btnVehicle">VEHICLE</button>
     <button class="btn" id="btnMap">ROAD</button>
+    <button class="btn" id="btnHistory">HISTORY</button>
     <button class="btn" id="btnMulti">MULTIPLAYER</button>
     <button class="btn" id="btnSettings">SETTINGS</button>
   </div>
@@ -44,12 +45,27 @@
 <div class="screen hidden" id="screen-vehicle">
   <div class="screen-title">SELECT VEHICLE</div>
   <div class="vehicle-grid" id="vehicleGrid"></div>
-  <button class="btn btn-back btn-small" id="btnVehicleBack">BACK</button>
+  <div class="menu-col compact" id="vehicleActions">
+    <button class="btn btn-primary btn-small hidden" id="btnVehicleContinue">CONTINUE</button>
+    <button class="btn btn-back btn-small" id="btnVehicleBack">BACK</button>
+  </div>
 </div>
 <div class="screen hidden" id="screen-map">
   <div class="screen-title">SELECT ROAD</div>
   <div class="vehicle-grid" id="mapGrid"></div>
-  <button class="btn btn-back btn-small" id="btnMapBack">BACK</button>
+  <div class="menu-col compact" id="mapActions">
+    <button class="btn btn-primary btn-small hidden" id="btnMapContinue">CONTINUE</button>
+    <button class="btn btn-back btn-small" id="btnMapBack">BACK</button>
+  </div>
+</div>
+
+<!-- ============ HISTORY ============ -->
+<div class="screen hidden" id="screen-history">
+  <div class="screen-title">RACE HISTORY</div>
+  <div class="lobby-panel history-panel">
+    <ul class="leaderboard history-list" id="historyList"></ul>
+  </div>
+  <button class="btn btn-back btn-small" id="btnHistoryBack">BACK</button>
 </div>
 
 <!-- ============ JOIN ============ -->
