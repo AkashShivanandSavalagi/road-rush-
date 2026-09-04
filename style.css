@@ -1,143 +1,198 @@
-"use strict";
-/* ROAD RUSH — music engine.
-   Original synthesized racing loop (WebAudio): drums + bass + arpeggio lead at 144 BPM.
-   100% original — no copyrighted audio.
-   OPTIONAL: put your own royalty-free file named "race-music.mp3" next to index.html
-   and it will be used automatically instead of the synth loop. */
+/* ============ ROAD RUSH — design system ============ */
+:root{
+  --bg:#0b0d14; --panel:#141826; --panel2:#1c2233; --panel3:#232b40;
+  --line:#2a3147; --line2:#39445f; --gold:#f3d34a; --gold-dk:#8a6d00;
+  --green:#4fd08a; --red:#e6533c; --blue:#4fa8e0; --cyan:#4fd6ff;
+  --text:#eef1f8; --muted:#93a0b8; --muted2:#6b7690;
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none;}
+html,body{margin:0;padding:0;width:100%;height:100%;background:var(--bg);color:var(--text);
+  font-family:'Segoe UI',system-ui,-apple-system,Arial,sans-serif;overflow:hidden;overscroll-behavior:none;}
 
-class MusicEngine {
-  constructor() {
-    this.enabled = true;
-    this.ctx = null; this.master = null;
-    this.timer = null; this.step = 0; this.nextT = 0;
-    this.bpm = 144; this.lookahead = 0.12; this.interval = 30;
-    this.ext = null; this._noiseBuf = null;
-  }
+.screen{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;
+  padding:18px 16px;overflow-y:auto;background:radial-gradient(1200px 700px at 50% -10%,#1a2138 0%,var(--bg) 68%);}
+.hidden{display:none!important;}
 
-  // Probe for an external music file once at page load.
-  probeExternal() {
-    try {
-      const a = new Audio();
-      a.src = "race-music.mp3"; a.loop = true; a.volume = 0.45; a.preload = "auto";
-      let done = false;
-      new Promise(res => {
-        a.addEventListener("canplaythrough", () => { if (!done) { done = true; res(true); } });
-        a.addEventListener("error", () => { if (!done) { done = true; res(false); } });
-        setTimeout(() => { if (!done) { done = true; res(false); } }, 1500);
-      }).then(ok => { this.ext = ok ? a : null; });
-    } catch (e) { this.ext = null; }
-  }
+.title-wrap{margin-top:6vh;text-align:center;}
+.game-title{font-size:clamp(38px,9vw,64px);font-weight:900;letter-spacing:3px;margin:0;color:var(--gold);
+  text-shadow:0 4px 0 var(--gold-dk),0 8px 24px rgba(0,0,0,.55);}
+.subtitle{color:var(--muted);font-size:15px;margin-top:8px;}
+.screen-title{font-size:clamp(20px,5vw,30px);color:var(--gold);margin:6px 0 16px;letter-spacing:2px;font-weight:800;}
 
-  _ensure() {
-    if (!this.ctx) {
-      try { this.ctx = new (window.AudioContext || window.webkitAudioContext)(); }
-      catch (e) { return false; }
-      this.master = this.ctx.createGain();
-      this.master.gain.value = 0.15;
-      this.master.connect(this.ctx.destination);
-    }
-    if (this.ctx.state === "suspended") this.ctx.resume();
-    return true;
-  }
+.menu-col{display:flex;flex-direction:column;gap:10px;width:min(360px,90vw);margin-top:16px;align-items:stretch;}
+.btn{padding:13px 20px;font-size:17px;font-weight:600;color:var(--text);background:var(--panel3);
+  border:2px solid var(--line2);border-radius:12px;cursor:pointer;transition:transform .07s,background .15s;}
+.btn:hover{background:#2c3652;}
+.btn:active{transform:scale(.965);}
+.btn-race{background:var(--red);border-color:#ff8a6c;color:#fff;font-size:22px;padding:19px;
+  box-shadow:0 6px 22px rgba(230,83,60,.35);}
+.btn-primary{background:#3560c2;border-color:#6f9ff0;}
+.btn-back{background:#171b26;border-color:#333;color:var(--muted);}
+.btn-small{padding:8px 16px;font-size:14px;}
 
-  _noise() {
-    if (this._noiseBuf) return this._noiseBuf;
-    const len = Math.floor(this.ctx.sampleRate * 0.3);
-    const buf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
-    const d = buf.getChannelData(0);
-    for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
-    this._noiseBuf = buf;
-    return buf;
-  }
+.vehicle-grid{display:flex;flex-direction:column;gap:14px;width:min(440px,92vw);margin-top:10px;}
+.vehicle-card{display:flex;align-items:center;gap:16px;padding:14px 16px;background:var(--panel);
+  border:2px solid var(--line);border-radius:14px;cursor:pointer;}
+.vehicle-card.selected{border-color:var(--gold);background:#20263a;}
+.vehicle-card .vshape{width:64px;height:40px;flex-shrink:0;}
+.vehicle-card .vinfo{flex:1;}
+.vehicle-card .vname{font-size:18px;font-weight:700;}
+.vehicle-card .vdesc{font-size:13px;color:var(--muted);margin-top:2px;}
+.vehicle-card .vstats{font-size:11px;color:var(--muted2);margin-top:4px;}
 
-  _kick(t) {
-    const o = this.ctx.createOscillator(), g = this.ctx.createGain();
-    o.type = "sine";
-    o.frequency.setValueAtTime(160, t);
-    o.frequency.exponentialRampToValueAtTime(45, t + 0.11);
-    g.gain.setValueAtTime(0.9, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.13);
-    o.connect(g).connect(this.master); o.start(t); o.stop(t + 0.14);
-  }
+.text-input{padding:14px;font-size:20px;text-align:center;letter-spacing:3px;border-radius:10px;
+  border:2px solid var(--line2);background:#10131c;color:#fff;text-transform:uppercase;outline:none;}
+.text-input.small{text-align:left;letter-spacing:normal;font-size:16px;padding:8px 10px;width:150px;}
+.setting-row{display:flex;align-items:center;justify-content:space-between;padding:10px 4px;}
+.stat-val{color:var(--gold);font-weight:700;}
+.error-text{color:#ff6b6b;font-size:14px;text-align:center;min-height:18px;}
+.status-text{color:var(--muted);font-size:14px;text-align:center;min-height:18px;}
 
-  _snare(t) {
-    const src = this.ctx.createBufferSource(); src.buffer = this._noise();
-    const f = this.ctx.createBiquadFilter(); f.type = "bandpass"; f.frequency.value = 1800; f.Q.value = 0.8;
-    const g = this.ctx.createGain();
-    g.gain.setValueAtTime(0.5, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.09);
-    src.connect(f).connect(g).connect(this.master); src.start(t); src.stop(t + 0.1);
-  }
+.room-code-box{text-align:center;margin-bottom:6px;}
+.room-code-label{font-size:11px;color:var(--muted);letter-spacing:2px;}
+.room-code{font-size:clamp(24px,6vw,34px);font-weight:900;letter-spacing:6px;color:var(--green);
+  background:#10131c;border:2px dashed #2a3350;border-radius:10px;padding:5px 16px;margin-top:3px;}
+.invite-row{display:flex;gap:10px;margin-top:6px;justify-content:center;}
+.invite-row .btn-small{margin-top:0;}
 
-  _hat(t, open) {
-    const src = this.ctx.createBufferSource(); src.buffer = this._noise();
-    const f = this.ctx.createBiquadFilter(); f.type = "highpass"; f.frequency.value = 7000;
-    const g = this.ctx.createGain();
-    g.gain.setValueAtTime(0.22, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + (open ? 0.08 : 0.03));
-    src.connect(f).connect(g).connect(this.master); src.start(t); src.stop(t + 0.1);
-  }
+.lobby-cols{display:flex;gap:14px;width:min(660px,94vw);flex-wrap:wrap;justify-content:center;margin-top:10px;}
+.lobby-panel{flex:1;min-width:240px;max-width:300px;background:rgba(18,22,34,.7);border:1px solid var(--line);
+  border-radius:12px;padding:10px 12px;max-height:200px;overflow-y:auto;}
+.panel-label{font-size:12px;color:var(--muted);letter-spacing:1px;margin-bottom:6px;text-transform:uppercase;}
+.panel-label #playerCount{color:var(--gold);}
+.player-list{list-style:none;margin:0;padding:0;}
+.player-list li{padding:6px 9px;border-radius:7px;background:var(--panel2);margin-bottom:5px;
+  display:flex;justify-content:space-between;font-size:13px;gap:8px;}
+.player-list .you-tag{color:var(--gold);font-size:11px;}
+.player-list .pl-right{color:var(--muted);font-size:11px;white-space:nowrap;}
+.player-list .ping{color:var(--green);}
+.map-select{display:flex;flex-direction:column;gap:5px;}
+.map-opt{padding:7px 9px;border-radius:7px;background:var(--panel2);cursor:pointer;font-size:13px;border:2px solid transparent;}
+.map-opt.selected{border-color:var(--gold);background:#262b40;}
+.map-select-readonly{font-size:14px;color:#ddd;}
 
-  _bass(t, freq) {
-    const o = this.ctx.createOscillator(), g = this.ctx.createGain(), f = this.ctx.createBiquadFilter();
-    o.type = "sawtooth"; o.frequency.value = freq;
-    f.type = "lowpass"; f.frequency.value = 420;
-    g.gain.setValueAtTime(0.45, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
-    o.connect(f).connect(g).connect(this.master); o.start(t); o.stop(t + 0.22);
-  }
+/* ============ RACE ============ */
+#screen-race{padding:0;overflow:hidden;background:#000;}
+#raceCanvas{display:block;width:100%;height:100%;touch-action:none;}
+.hud{position:absolute;top:0;left:0;right:0;padding:8px 14px;display:flex;flex-direction:column;gap:4px;
+  pointer-events:none;font-size:14px;text-shadow:0 2px 3px rgba(0,0,0,.8);z-index:5;}
+.hud-top{display:flex;align-items:center;gap:10px;}
+.hud-right{margin-left:auto;}
+.hud-fuel-label{font-size:10px;color:#ccc;letter-spacing:1px;}
+.hud-fuel-row{display:flex;align-items:center;gap:8px;max-width:360px;}
+.hud-fuel-wrap{flex:1;max-width:200px;height:12px;background:#0006;border-radius:6px;overflow:hidden;}
+.hud-fuel-bar{height:100%;width:100%;background:linear-gradient(90deg,#6ee7a8,#39c96b);transition:width .2s;}
+.hud-bottom-left{display:flex;align-items:center;gap:10px;}
+.nitro-wrap{display:flex;flex-direction:column;gap:2px;align-items:center;}
+.nitro-pips{display:flex;gap:4px;}
+.nitro-pips .pip{width:12px;height:12px;border-radius:50%;background:#2a3350;}
+.nitro-pips .pip.on{background:var(--cyan);box-shadow:0 0 6px var(--cyan);}
+.hud-chip{background:#000a;padding:2px 9px;border-radius:6px;font-weight:700;}
+.hud-warning{color:#ffce54;font-size:13px;font-weight:600;min-height:16px;}
 
-  _lead(t, freq) {
-    const o = this.ctx.createOscillator(), g = this.ctx.createGain();
-    o.type = "square"; o.frequency.value = freq;
-    g.gain.setValueAtTime(0.09, t);
-    g.gain.exponentialRampToValueAtTime(0.001, t + 0.11);
-    o.connect(g).connect(this.master); o.start(t); o.stop(t + 0.12);
-  }
+/* live standings: top-5 + you */
+.race-list{position:absolute;top:100px;right:10px;z-index:6;display:flex;flex-direction:column;gap:3px;
+  pointer-events:none;min-width:160px;}
+.rl-row{background:#000b;border-radius:6px;padding:3px 9px;font-size:11px;color:#cdd3e0;display:flex;
+  gap:8px;align-items:center;text-shadow:0 1px 2px #000;}
+.rl-row.me{border:1px solid var(--gold);color:#fff;font-weight:700;}
+.rl-place{font-weight:800;color:var(--gold);width:16px;}
+.rl-name{flex:1;max-width:88px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.rl-gap{color:#8fd6a8;font-size:10px;white-space:nowrap;}
+.rl-sep{text-align:center;color:var(--muted2);font-size:10px;line-height:6px;}
 
-  // One bar = 16 sixteenth-steps. 4-bar loop: bass throughout, lead on bars 2 & 4.
-  _scheduleStep(step, t) {
-    const s = step % 16;
-    const bar = Math.floor(step / 16) % 4;
-    if (s % 4 === 0) this._kick(t);
-    if (s === 4 || s === 12) this._snare(t);
-    if (s % 2 === 1) this._hat(t, s === 15);
-    // E-minor bass groove (E1 G1 A1 B1 Bb1)
-    const bassSeq = [41.2, 0, 41.2, 0, 49.0, 0, 41.2, 0, 55.0, 0, 41.2, 0, 61.7, 0, 58.3, 0];
-    if (bassSeq[s]) this._bass(t, bassSeq[s]);
-    if (bar === 1 || bar === 3) {
-      const leadSeq = [329.6, 392, 493.9, 659.3, 493.9, 392, 329.6, 392,
-                       329.6, 392, 493.9, 659.3, 587.3, 493.9, 392, 329.6];
-      this._lead(t, leadSeq[s]);
-    }
-  }
+.countdown-overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  pointer-events:none;z-index:9;}
+.countdown-num{font-size:clamp(70px,18vw,130px);font-weight:900;color:var(--gold);
+  text-shadow:0 6px 0 var(--gold-dk),0 10px 24px rgba(0,0,0,.6);animation:pop .5s ease;}
+@keyframes pop{from{transform:scale(.4);opacity:0;}to{transform:scale(1);opacity:1;}}
 
-  _tick() {
-    const stepDur = 60 / this.bpm / 4; // 16th note
-    while (this.nextT < this.ctx.currentTime + this.lookahead) {
-      this._scheduleStep(this.step, this.nextT);
-      this.nextT += stepDur;
-      this.step++;
-    }
-  }
+.icon-btn{position:absolute;width:42px;height:42px;border-radius:50%;background:#000a;border:2px solid #fff4;
+  color:#fff;font-size:16px;font-weight:700;cursor:pointer;z-index:7;}
+.pause-btn{top:12px;right:12px;}
 
-  start() {
-    if (!this.enabled) return;
-    if (this.ext) { try { this.ext.currentTime = 0; this.ext.play().catch(() => {}); } catch (e) {} return; }
-    if (!this._ensure()) return;
-    if (this.timer) return; // already playing
-    this.step = 0;
-    this.nextT = this.ctx.currentTime + 0.05;
-    this.timer = setInterval(() => this._tick(), this.interval);
-  }
+/* DESKTOP key hints */
+.key-hints{position:absolute;bottom:12px;left:50%;transform:translateX(-50%);display:flex;gap:14px;
+  background:#000b;border:1px solid #ffffff14;border-radius:12px;padding:7px 14px;z-index:7;
+  transition:opacity .8s;pointer-events:none;flex-wrap:wrap;justify-content:center;max-width:92vw;}
+.key-hints kbd{background:var(--panel2);border:1px solid var(--line2);border-bottom-width:3px;border-radius:5px;
+  padding:1px 6px;font-size:11px;font-family:inherit;color:var(--text);}
+.key-hints .kh{font-size:11px;color:var(--muted);display:flex;align-items:center;gap:4px;}
+.key-hints.faded{opacity:.3;}
+.is-touch .key-hints{display:none;}
 
-  stop() {
-    if (this.ext) { try { this.ext.pause(); } catch (e) {} }
-    if (this.timer) { clearInterval(this.timer); this.timer = null; }
-  }
+/* MOBILE pedals: left GAS+BRAKE, center tilt, right NOS+JUMP */
+.mobile-controls{position:absolute;bottom:calc(14px + env(safe-area-inset-bottom,0px));left:0;right:0;
+  display:flex;justify-content:space-between;align-items:flex-end;padding:0 12px;pointer-events:none;z-index:8;}
+.mc-cluster{display:flex;gap:12px;align-items:flex-end;pointer-events:none;}
+.mc-tilt{display:flex;gap:10px;align-items:flex-end;pointer-events:none;}
+.mc-cluster .pedal,.mc-tilt .pedal{pointer-events:auto;}
+.pedal{width:84px;height:84px;border-radius:50%;font-weight:800;font-size:13px;letter-spacing:1px;
+  color:#fff;border:3px solid #fff3;opacity:.9;touch-action:none;cursor:pointer;}
+.pedal-gas{background:radial-gradient(circle at 35% 30%,#6ee7a8,#1f8f4d);width:92px;height:92px;}
+.pedal-brake{background:radial-gradient(circle at 35% 30%,#ff8b8b,#b3251f);width:70px;height:70px;}
+.pedal-nitro{background:radial-gradient(circle at 35% 30%,#7fd4ff,#1560a8);width:64px;height:64px;}
+.pedal-jump{background:radial-gradient(circle at 35% 30%,#8ef0c0,#1d8f6f);width:84px;height:84px;font-size:15px;}
+.pedal-tilt{background:radial-gradient(circle at 35% 30%,#9aa3b8,#3a4258);width:52px;height:52px;font-size:18px;}
+.pedal.pressed{transform:scale(.92);filter:brightness(1.35);}
+.pedal-jump.pressed{box-shadow:0 0 16px #6ee7a8;}
+.pedal-nitro.pressed{box-shadow:0 0 16px var(--cyan);}
 
-  setEnabled(on) {
-    this.enabled = on;
-    if (!on) this.stop();
-  }
+/* overlays */
+.overlay{position:fixed;inset:0;background:#000d;z-index:50;display:flex;flex-direction:column;
+  align-items:center;justify-content:center;gap:10px;overflow-y:auto;padding:20px 12px;}
+.big-label{font-size:34px;font-weight:800;color:var(--gold);}
+.sub-label{font-size:15px;color:#ccc;text-align:center;max-width:90vw;}
+.qr-box{background:#fff;padding:12px;border-radius:12px;min-width:190px;min-height:190px;
+  display:flex;align-items:center;justify-content:center;}
+.qr-link{max-width:300px;word-break:break-all;font-size:12px;color:var(--muted);}
+
+/* pause controls table */
+.controls-grid{display:grid;grid-template-columns:auto auto;gap:6px 16px;margin:6px 0;
+  background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:12px 18px;align-items:center;}
+.controls-grid kbd{background:var(--panel2);border:1px solid var(--line2);border-bottom-width:3px;border-radius:5px;
+  padding:2px 8px;font-size:12px;color:var(--text);}
+.controls-grid .pc-row span{font-size:13px;color:var(--muted);}
+.pc-note{font-size:13px;color:var(--muted);text-align:center;max-width:300px;}
+
+/* result: stats chips + podium + rows */
+.result-stats{display:flex;gap:8px;flex-wrap:wrap;justify-content:center;max-width:92vw;}
+.rs-chip{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:5px 10px;
+  font-size:12px;color:var(--muted);}
+.rs-chip b{color:var(--text);}
+.podium{display:flex;align-items:flex-end;gap:10px;margin:6px 0 2px;}
+.pod{background:var(--panel2);border:2px solid var(--line2);border-radius:10px 10px 4px 4px;
+  display:flex;flex-direction:column;align-items:center;justify-content:flex-end;padding:8px 10px;min-width:88px;}
+.pod .medal{width:34px;height:34px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  font-weight:900;font-size:16px;margin-bottom:6px;}
+.pod-1{height:112px;border-color:var(--gold);}
+.pod-1 .medal{background:linear-gradient(180deg,#ffe98a,#d4af37);color:#5a4200;}
+.pod-2{height:88px;}
+.pod-2 .medal{background:linear-gradient(180deg,#e8ecf2,#9aa7bd);color:#333;}
+.pod-3{height:72px;}
+.pod-3 .medal{background:linear-gradient(180deg,#e0a878,#a86f3c);color:#3d2208;}
+.pod .pname{font-size:12px;max-width:92px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;}
+.pod .ptime{font-size:10px;color:var(--muted);}
+.leaderboard{width:min(480px,94vw);margin:0;padding:0;list-style:none;max-height:34vh;overflow-y:auto;}
+.leaderboard li{display:flex;justify-content:space-between;align-items:center;background:var(--panel);
+  border-radius:10px;padding:10px 16px;margin-bottom:7px;font-size:15px;}
+.leaderboard li.me{border:2px solid var(--gold);background:#20263a;}
+.leaderboard .lb-place{font-weight:800;width:34px;color:var(--gold);}
+.leaderboard .lb-name{flex:1;padding-left:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+.leaderboard .lb-detail{font-size:12px;color:var(--muted);text-align:right;}
+
+/* rotate prompt (touch only) */
+.rotate-phone{width:46px;height:80px;border:4px solid var(--muted);border-radius:10px;position:relative;
+  animation:rot 1.8s ease infinite;}
+@keyframes rot{0%,25%{transform:rotate(0);}60%,100%{transform:rotate(90deg);}}
+
+.footer-note{position:absolute;bottom:10px;font-size:11px;color:#556;text-align:center;padding:0 20px;}
+
+@media (max-width:900px) and (orientation:landscape){
+  .hud{font-size:12px;}
+  .race-list{top:88px;min-width:132px;}
+  .rl-name{max-width:70px;}
+  .pedal-gas{width:78px;height:78px;}
+  .pedal-jump{width:72px;height:72px;}
+  .key-hints{display:none;}
 }
