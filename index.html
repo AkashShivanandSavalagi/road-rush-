@@ -7,9 +7,7 @@
 <title>ROAD RUSH</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23f3d34a'/%3E%3Cpath d='M7 22 L16 8 L25 22' fill='none' stroke='%230a0a0e' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
 <link rel="stylesheet" href="style.css">
-<!-- Optional local PeerJS. If this file is absent the game still works:
-     game.js loads the library from a CDN only when multiplayer is used.
-     Single player never needs the internet. -->
+<!-- Optional local PeerJS. If absent, game.js loads it from a CDN only when multiplayer is used. -->
 <script src="peerjs.min.js"></script>
 </head>
 <body>
@@ -67,6 +65,10 @@
   </div>
   <div class="status-text" id="joinStatus"></div>
   <div class="error-text" id="joinError"></div>
+  <div class="status-text" style="max-width:340px;font-size:12px">
+    Tip: the host can show a QR code or invite link in the lobby — scanning it fills this in for you.
+    If connecting fails, check both devices are online and the host keeps the game open.
+  </div>
 </div>
 
 <!-- ============ LOBBY ============ -->
@@ -75,10 +77,14 @@
     <div class="room-code-label">ROOM CODE</div>
     <div class="room-code" id="roomCode">-----</div>
   </div>
+  <div class="invite-row" id="inviteRow">
+    <button class="btn btn-small" id="btnCopyLink">&#128203; COPY LINK</button>
+    <button class="btn btn-small" id="btnShowQr">&#9638; QR CODE</button>
+  </div>
   <div class="status-text" id="lobbyStatus"></div>
   <div class="lobby-cols">
     <div class="lobby-panel">
-      <div class="panel-label">Players</div>
+      <div class="panel-label">Players <span id="playerCount"></span></div>
       <ul class="player-list" id="lobbyPlayers"></ul>
     </div>
     <div class="lobby-panel">
@@ -103,6 +109,7 @@
   <div class="screen-title">SETTINGS</div>
   <div class="menu-col">
     <div class="setting-row"><span>Sound</span><button class="btn btn-small" id="btnSoundToggle">ON</button></div>
+    <div class="setting-row"><span>On-screen pedals</span><button class="btn btn-small" id="btnPedalsToggle">ON</button></div>
     <div class="setting-row"><span>Best score</span><span id="settingsBest">0</span></div>
     <div class="setting-row"><span>Total coins</span><span id="settingsCoins">0</span></div>
     <button class="btn btn-small" id="btnResetSave">RESET PROGRESS</button>
@@ -134,6 +141,7 @@
     </div>
     <div class="error-text" id="hudWarning"></div>
   </div>
+  <div class="race-list hidden" id="raceList"></div>
   <button class="icon-btn pause-btn" id="btnPause">II</button>
   <div class="countdown-overlay hidden" id="countdownOverlay"><div class="countdown-num" id="countdownNum">3</div></div>
   <div class="touch-controls hidden" id="touchControls">
@@ -142,6 +150,7 @@
     </div>
     <div class="tc-side">
       <button class="pedal pedal-tilt" id="btnTiltL">&#9664;</button>
+      <button class="pedal pedal-jump" id="btnJump">JUMP</button>
       <button class="pedal pedal-tilt" id="btnTiltR">&#9654;</button>
     </div>
     <div class="tc-side">
@@ -171,6 +180,14 @@
     <button class="btn" id="btnResultLobby">BACK TO LOBBY</button>
     <button class="btn btn-back" id="btnResultHome">HOME</button>
   </div>
+</div>
+
+<div class="overlay hidden" id="overlay-qr">
+  <div class="big-label" style="font-size:22px">SCAN TO JOIN</div>
+  <div class="qr-box" id="qrBox"></div>
+  <div class="room-code" id="qrCodeText">-----</div>
+  <div class="sub-label qr-link" id="qrUrl"></div>
+  <button class="btn btn-back btn-small" id="btnQrClose">CLOSE</button>
 </div>
 
 <div class="overlay hidden" id="overlay-rotate">
