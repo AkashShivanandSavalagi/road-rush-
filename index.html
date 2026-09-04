@@ -74,11 +74,18 @@
   <div class="room-code-box" id="roomCodeBox">
     <div class="room-code-label">ROOM CODE</div>
     <div class="room-code" id="roomCode">-----</div>
+    <div class="room-qr-wrap">
+      <img class="room-qr hidden" id="roomQr" alt="Room QR code">
+      <div class="status-text" id="roomQrStatus"></div>
+    </div>
   </div>
   <div class="status-text" id="lobbyStatus"></div>
   <div class="lobby-cols">
     <div class="lobby-panel">
-      <div class="panel-label">Players</div>
+      <div class="panel-head">
+        <div class="panel-label">Players</div>
+        <div class="panel-count" id="lobbyPlayerCount">0/4</div>
+      </div>
       <ul class="player-list" id="lobbyPlayers"></ul>
     </div>
     <div class="lobby-panel">
@@ -145,6 +152,7 @@
       <button class="pedal pedal-tilt" id="btnTiltR">&#9654;</button>
     </div>
     <div class="tc-side">
+      <button class="pedal pedal-jump" id="btnJump">JUMP</button>
       <button class="pedal pedal-nitro" id="btnNitro">NOS</button>
       <button class="pedal pedal-gas" id="btnGas">GAS</button>
     </div>
