@@ -1,23 +1,44 @@
 "use strict";
 /* =====================================================================================
-   ROAD RUSH — web edition (final)
-   Desktop + mobile layouts · 20-player P2P multiplayer · QR join · live top-5 standings
-   Fuel fills to FULL · JUMP · numpad 8/4/6/2 + WASD + arrows · synthesized soundtrack.
+   ROAD RUSH — web edition, host-authoritative multiplayer build.
+   Multiplayer model (honest description):
+   - Transport: WebRTC data channels via PeerJS, star topology through the host.
+   - Authority: the HOST's browser is the referee — room membership, passwords,
+     kicks, chat moderation, race start ("GO"), pickup allocation, standings and
+     finish validation all happen host-side. This is host-authoritative, NOT
+     server-authoritative: the host is a single point of failure and a malicious
+     host can cheat. A true authoritative server (Node+Colyseus) requires hosting
+     that GitHub Pages cannot provide — see README "Phase B".
+   - Identity: every client generates a random 12-hex session id (sid). The host
+     roster is keyed by sid, so a dropped/reloaded player reconnects with the same
+     identity within a 30 s grace window.
 ===================================================================================== */
 
-/* ------------------------------ constants ------------------------------ */
+/* ------------------------------ configuration ------------------------------ */
+const CONFIG = {
+  MAX_PLAYERS: 4,          // competitive racers per room (raise if desired; star topology stays fine to ~8)
+  CODE_LEN: 6,             // 6-character room code
+  NET_SEND_HZ: 15,         // own-state broadcast rate
+  RACE_TIMEOUT: 240,       // hard race time limit (s)
+  CHAT_MAX_LEN: 200,
+  CHAT_COOLDOWN_MS: 1500,  // per player
+  EMOTE_COOLDOWN_MS: 2000, // per player
+  PASS_ATTEMPTS: 5,        // password guesses per connection
+  RECONNECT_GRACE: 30,     // seconds a disconnected player keeps their slot
+  RECONNECT_ATTEMPTS: 15,  // guest retry cycles (2 s apart)
+  STRIKES_KICK: 3,         // RoadGuard: suspicious packets before removal
+};
+const FEEDBACK_EMAIL = "you@example.com"; // ← put your real email here for the feedback page
+
 const FINISH_DISTANCE = 24000;   // world units (1 unit = 0.1 m → 2400 m)
 const UNIT_TO_M = 0.1;
 const GRAVITY_BASE = 1800;
 const GROUND_FRICTION = 0.985;
-const MAX_PLAYERS = 20;          // up to 20 racers in one room
-const NET_SEND_HZ = 15;
-const RACE_TIMEOUT = 240;
 const START_X = 120;
 const JUMP_HEIGHT = 90;
 const JUMP_COOLDOWN = 1.2;
 
-/* STUN + TURN: TURN relays traffic when direct P2P is blocked (carrier NATs etc). */
+/* STUN + TURN: TURN relays traffic when direct P2P is blocked (carrier NATs). */
 const PEER_OPTS = {
   debug: 0,
   config: {
@@ -33,6 +54,7 @@ const PEER_OPTS = {
   },
 };
 
+/* ------------------------------ generic helpers ------------------------------ */
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function lerp(a, b, t) { return a + (b - a) * t; }
 function fmtTime(t) { const m = Math.floor(t / 60), s = Math.floor(t % 60); return m + ":" + (s < 10 ? "0" : "") + s; }
@@ -52,6 +74,62 @@ function mulberry32(seed) {
   };
 }
 const $ = id => document.getElementById(id);
+function nowMs() { return performance.now(); }
+function randomHex(n) {
+  const c = "0123456789abcdef";
+  let s = "";
+  for (let i = 0; i < n; i++) s += c[Math.floor(Math.random() * 16)];
+  return s;
+}
+
+/* ------------------------------ pure, unit-testable rules (tested by tests.html) ------------------------------ */
+
+/* Username rules: strip control chars, trim, collapse inner whitespace, 2–16 chars. */
+function validateName(raw) {
+  if (typeof raw !== "string") return { ok: false, reason: "Name required." };
+  const name = raw.replace(/[\u0000-\u001F\u007F]/g, "").trim().replace(/\s+/g, " ");
+  if (!name) return { ok: false, reason: "Name required." };
+  if (name.length < 2) return { ok: false, reason: "At least 2 characters." };
+  if (name.length > 16) return { ok: false, reason: "Maximum 16 characters." };
+  return { ok: true, name };
+}
+
+/* Room code: 6 chars from an unambiguous set (no O/0, I/1, S/5). */
+const CODE_CHARS = "ABCDEFGHJKMNPQRTUVWXYZ2346789";
+function makeRoomCode(rng) {
+  const r = rng || Math.random;
+  let s = "";
+  for (let i = 0; i < CONFIG.CODE_LEN; i++) s += CODE_CHARS[Math.floor(r() * CODE_CHARS.length)];
+  return s;
+}
+
+/* Sliding-interval rate limiter (host-side moderation + tests). */
+class RateLimiter {
+  constructor(minIntervalMs) { this.min = minIntervalMs; this.last = -Infinity; }
+  allow(now) {
+    const t = (now == null) ? nowMs() : now;
+    if (t - this.last < this.min) return false;
+    this.last = t; return true;
+  }
+}
+
+/* Game-rule pure helpers. */
+function fillFuel(cur, cap) { return cap; }                 // fuel pickup refills to FULL
+function addNitro(cur, max) { return Math.min(max, cur + 1); }
+function validFinishMsg(elapsed, t, dist, finishDist) {      // RoadGuard finish plausibility
+  return typeof t === "number" && t >= 0 && t <= elapsed + 2 &&
+         typeof dist === "number" && dist >= finishDist - 400;
+}
+function deltaOk(maxSpeed, dtSec, delta, slack) {            // RoadGuard speed bound
+  return delta <= maxSpeed * 2.2 * dtSec + (slack == null ? 120 : slack);
+}
+const PLACE_BONUS = { 1: 1000, 2: 700, 3: 400 };
+function computeScore(distanceM, coins, place, fuelRemaining) {
+  let s = distanceM * 10 + coins * 10 + fuelRemaining * 2;
+  if (PLACE_BONUS[place]) s += PLACE_BONUS[place];
+  else if (place && place > 3) s += Math.max(0, 200 - (place - 4) * 20);
+  return Math.round(s);
+}
 
 /* ------------------------------ maps & vehicles ------------------------------ */
 const MAPS = {
@@ -86,23 +164,38 @@ const VEHICLES = {
 };
 
 /* ------------------------------ save ------------------------------ */
-const SAVE_KEY = "roadrush_save_v2";
-const save = { name: "Player", vehicle: "Car", map: "Highway", sound: true, music: true, pedals: false, best: 0, coins: 0 };
+const SAVE_KEY = "roadrush_save_v3";
+const save = {
+  name: "", vehicle: "Car", map: "Highway",
+  sound: true, music: true, pedals: false,
+  quality: "auto", vibration: true, reducedMotion: false, firstRun: true,
+  best: 0, coins: 0,
+};
 function loadSave() {
   try {
     const obj = JSON.parse(localStorage.getItem(SAVE_KEY));
     if (!obj || typeof obj !== "object") return;
-    if (typeof obj.name === "string" && obj.name) save.name = obj.name.slice(0, 12);
+    if (typeof obj.name === "string") save.name = obj.name.slice(0, 16);
     if (VEHICLES[obj.vehicle]) save.vehicle = obj.vehicle;
     if (MAPS[obj.map]) save.map = obj.map;
-    if (typeof obj.sound === "boolean") save.sound = obj.sound;
-    if (typeof obj.music === "boolean") save.music = obj.music;
-    if (typeof obj.pedals === "boolean") save.pedals = obj.pedals;
+    ["sound", "music", "pedals", "vibration", "reducedMotion", "firstRun"].forEach(k => {
+      if (typeof obj[k] === "boolean") save[k] = obj[k];
+    });
+    if (["auto", "low", "medium", "high"].includes(obj.quality)) save.quality = obj.quality;
     if (typeof obj.best === "number" && isFinite(obj.best)) save.best = Math.max(0, Math.floor(obj.best));
     if (typeof obj.coins === "number" && isFinite(obj.coins)) save.coins = Math.max(0, Math.floor(obj.coins));
   } catch (e) {}
 }
 function persist() { try { localStorage.setItem(SAVE_KEY, JSON.stringify(save)); } catch (e) {} }
+
+/* session identity (survives page reload within the tab, per room) */
+function sidFor(code) {
+  try {
+    let sid = sessionStorage.getItem("rr_sid_" + code);
+    if (!sid) { sid = randomHex(12); sessionStorage.setItem("rr_sid_" + code, sid); }
+    return sid;
+  } catch (e) { return randomHex(12); }
+}
 
 /* ------------------------------ terrain + world ------------------------------ */
 class Terrain {
@@ -124,20 +217,20 @@ class Terrain {
   slopeAt(x) { return (this.heightAt(x + 2) - this.heightAt(x - 2)) / 4; }
 }
 
+/* Pickups get stable ids so the host can validate claims atomically. */
 function generateWorldObjects(terrain, seed, length) {
   const rng = mulberry32((seed ^ 0xC0FFEE) >>> 0);
   const pickups = [], obstacles = [];
-  // GUARANTEED fuel roughly every 350 m so you can never strand mid-race.
-  for (let fx = 900; fx < length - 400; fx += 3500) {
-    pickups.push({ x: fx, kind: "fuel", taken: false, bob: rng() * 6.28 });
-  }
+  let pid = 0;
+  const addPk = (x, kind) => pickups.push({ id: pid++, x, kind, taken: false, bob: rng() * 6.28 });
+  for (let fx = 900; fx < length - 400; fx += 3500) addPk(fx, "fuel"); // guaranteed fuel ~every 350 m
   let x = 600;
   while (x < length - 400) {
     x += 150 + rng() * 130;
     const roll = rng();
-    if (roll < 0.17) pickups.push({ x, kind: "fuel", taken: false, bob: rng() * 6.28 });
-    else if (roll < 0.30) pickups.push({ x, kind: "nitro", taken: false, bob: rng() * 6.28 });
-    else if (roll < 0.58) pickups.push({ x, kind: "coin", taken: false, bob: rng() * 6.28 });
+    if (roll < 0.17) addPk(x, "fuel");
+    else if (roll < 0.30) addPk(x, "nitro");
+    else if (roll < 0.58) addPk(x, "coin");
   }
   const kindMap = { Highway: "traffic", Hills: "log", Moon: "crater", Desert: "cactus", Snow: "ice" };
   const kind = kindMap[terrain.def.label] || "rock";
@@ -154,11 +247,17 @@ function generateWorldObjects(terrain, seed, length) {
   return { pickups, obstacles };
 }
 
-/* ------------------------------ particles ------------------------------ */
+/* ------------------------------ particles (quality-aware) ------------------------------ */
 class ParticleSystem {
   constructor() { this.list = []; }
+  cap() {
+    if (save.quality === "low") return 60;
+    if (save.quality === "medium") return 150;
+    if (save.quality === "high") return 350;
+    return isTouch ? 150 : 350; // auto
+  }
   emit(x, y, n, color, opts = {}) {
-    if (this.list.length > 350) n = Math.min(n, 2);
+    if (this.list.length > this.cap()) n = Math.min(n, 2);
     const speed = opts.speed || 140, spread = opts.spread || 100, life = opts.life || 0.5,
           size = opts.size || 3, gravity = opts.gravity != null ? opts.gravity : 800;
     for (let i = 0; i < n; i++) {
@@ -236,6 +335,7 @@ class Sfx {
   }
   engineStop() { if (this.engine) { try { this.engine.osc.stop(); } catch (e) {} this.engine = null; } }
 }
+function vibrate(ms) { if (save.vibration && navigator.vibrate) { try { navigator.vibrate(ms); } catch (e) {} } }
 
 /* ------------------------------ vehicle physics ------------------------------ */
 class RacePlayer {
@@ -249,6 +349,7 @@ class RacePlayer {
     this.fuelMult = opts.fuelMult || 1;
     this.terrain = terrain;
     this.id = opts.id || "local";
+    this.sid = opts.sid || null;      // network identity
     this.name = opts.name || "Player";
     this.isRemote = !!opts.isRemote;
     this.isBot = !!opts.isBot;
@@ -292,7 +393,8 @@ class RacePlayer {
     if (this.nitroTimer > 0) this.nitroTimer -= dt;
     const nitroBoost = this.nitroTimer > 0 ? 1.55 : 1.0;
 
-    // JUMP: vy = sqrt(2·g·h) gives the same hop height on every map.
+    /* JUMP: vy = sqrt(2·g·h) ⇒ identical hop height on every map (Moon just
+       gets a slower launch). Cooldown prevents mid-air spam. */
     if (jump && raceStarted && this.onGround && this.stunned <= 0 && this.jumpCd <= 0) {
       this.vy = -Math.sqrt(2 * gravity * JUMP_HEIGHT);
       this.onGround = false;
@@ -373,6 +475,7 @@ class RacePlayer {
 
   _crash(particles, sfx) {
     if (sfx) sfx.play("collision");
+    vibrate(40);
     particles.emit(this.x, this.y, 14, "#ff8c28", { spread: 140, speed: 180, life: 0.5, size: 3, gravity: 700 });
     this.vx *= 0.35; this.stunned = 0.5; this.shake = 1;
     this.angle = clamp(this.angle, -35, 35);
@@ -383,46 +486,61 @@ function rectsOverlap(a, b) {
   return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
 }
 
-/* ------------------------------ scoring ------------------------------ */
-const PLACE_BONUS = { 1: 1000, 2: 700, 3: 400 };
-function computeScore(distanceM, coins, place, fuelRemaining) {
-  let s = distanceM * 10 + coins * 10 + fuelRemaining * 2;
-  if (PLACE_BONUS[place]) s += PLACE_BONUS[place];
-  else if (place && place > 3) s += Math.max(0, 200 - (place - 4) * 20);
-  return Math.round(s);
-}
-
-/* ------------------------------ networking (20 players, TURN, ping, retry) ------------------------------ */
+/* =====================================================================================
+   NETWORKING — host-authoritative star topology.
+   Identity: sid (session id) generated by each client, roster keyed by it.
+   Authority held by the host: join gate (lock/password/name/full/dup session),
+   chat/emote moderation, pickup allocation ("pk" claims), speed-bound validation
+   (RoadGuard strikes), finish validation, race start ("go"), standings broadcast.
+===================================================================================== */
 class NetManager {
   constructor() {
     this.peer = null; this.isHost = false; this.roomCode = null;
-    this.myId = null; this.myName = "Player";
-    this.conns = new Map(); this.hostConn = null;
-    this.players = new Map();
+    this.mySid = null; this.myName = "Player"; this.hostPeerId = null;
+    this.conns = new Map();      // peerId -> {conn, sid}
+    this.hostConn = null;
+    this.players = new Map();    // sid -> {sid, peerId, name, vehicle, isHost, ping, disconnectedAt}
     this.selectedMap = "Highway";
-    this.raceRoster = []; this.finishList = []; this.lastStates = new Map();
-    this._joinSettle = null; this._pingTimer = null; this._destroyed = false;
+    this.password = "";          // host only, never transmitted except comparison at join
+    this.locked = false;
+    this.raceRoster = []; this.finishList = []; this.lastStates = new Map(); // sid -> state
+    this._lastD = new Map(); this._lastDT = new Map();  // RoadGuard speed tracking
+    this.strikes = new Map();    // sid -> {n, lastT}
+    this._chatL = new Map(); this._emoteL = new Map(); this._passN = new Map();
+    this._joinSettle = null; this._pingTimer = null; this._guestPing = null;
+    this._destroyed = false; this._reconn = null; this._kicked = false;
+    this._graceTimers = new Map();
+    this.rtt = 0; this.connState = "offline";
+    // callbacks (assigned by the Game)
     this.onPlayersChanged = null; this.onMapChanged = null; this.onRaceStart = null;
-    this.onWorldUpdate = null; this.onLeaderboard = null; this.onError = null;
-    this.onHostLeft = null; this.onReturnToLobby = null;
+    this.onGo = null; this.onWorldUpdate = null; this.onLeaderboard = null;
+    this.onError = null; this.onHostLeft = null; this.onReturnToLobby = null;
+    this.onKicked = null; this.onChat = null; this.onEmote = null;
+    this.onRoomCfg = null; this.onPositions = null; this.onPickup = null;
+    this.onConnState = null;
     this._onGuestFinish = null;
   }
-  _makeRoomCode() {
-    const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-    let s = "";
-    for (let i = 0; i < 5; i++) s += chars[Math.floor(Math.random() * chars.length)];
-    return s;
+
+  _setConnState(s) {
+    if (this.connState !== s) { this.connState = s; if (this.onConnState) this.onConnState(s); }
   }
-  createRoom(name) {
+
+  createRoom(name, pass) {
     return new Promise((resolve, reject) => {
       if (!window.Peer) { reject(new Error("no-peerjs")); return; }
-      this.myName = name || "Host";
+      const v = validateName(name);
+      if (!v.ok) { reject(new Error("badname:" + v.reason)); return; }
+      this.myName = v.name;
+      this.password = (pass || "").toString().slice(0, 24);
       this.isHost = true;
+      this.mySid = randomHex(12);
+      this._setConnState("connecting");
       this._createWithRetry(0, resolve, reject);
     });
   }
+
   _createWithRetry(attempt, resolve, reject) {
-    const code = this._makeRoomCode();
+    const code = makeRoomCode();
     let settled = false;
     try { this.peer = new Peer("roadrush-" + code, PEER_OPTS); }
     catch (e) { reject(e); return; }
@@ -440,8 +558,12 @@ class NetManager {
     this.peer.on("open", (id) => {
       if (settled || this._destroyed) return;
       settled = true;
-      this.roomCode = code; this.myId = id;
-      this.players.set(id, { id, name: this.myName, vehicle: save.vehicle, ready: true, isHost: true, ping: 0 });
+      this.roomCode = code; this.hostPeerId = id;
+      this.players.set(this.mySid, {
+        sid: this.mySid, peerId: id, name: this.myName, vehicle: save.vehicle,
+        isHost: true, ping: 0,
+      });
+      this._setConnState("connected");
       this._startPingLoop();
       resolve(code);
     });
@@ -449,53 +571,142 @@ class NetManager {
     this.peer.on("disconnected", () => {
       if (this._destroyed) return;
       try { this.peer.reconnect(); } catch (e) {}
+      this._setConnState("reconnecting");
       if (this.onError) this.onError("Reconnecting to the signaling service…");
     });
   }
+
+  /* host: heartbeat to guests (lobby ping display) */
   _startPingLoop() {
     this._stopPingLoop();
     this._pingTimer = setInterval(() => {
       if (this._destroyed || !this.isHost) return;
-      const now = performance.now();
-      for (const [id, conn] of this.conns) {
-        if (conn.open) { try { conn.send({ t: "ping", ts: now }); } catch (e) {} }
+      for (const { conn, sid} of this.conns.values()) {
+        const p = this.players.get(sid);
+        if (conn.open && p && p.disconnectedAt == null) {
+          try { conn.send({ t: "ping", ts: nowMs() }); } catch (e) {}
+        }
       }
     }, 3000);
   }
   _stopPingLoop() { if (this._pingTimer) { clearInterval(this._pingTimer); this._pingTimer = null; } }
+
   _handleIncoming(conn) {
     conn.on("open", () => {
-      this.conns.set(conn.peer, conn);
       conn.on("data", (data) => this._handleGuestMessage(conn, data));
     });
-    conn.on("close", () => this._removePlayer(conn.peer));
-    conn.on("error", () => this._removePlayer(conn.peer));
+    conn.on("close", () => this._peerDropped(conn));
+    conn.on("error", () => this._peerDropped(conn));
   }
-  _removePlayer(id) {
-    this.conns.delete(id);
-    if (this.players.has(id)) {
-      this.players.delete(id);
-      this.lastStates.delete(id);
-      this._emitPlayers();
-      this.broadcast({ t: "players", list: this._playerListArr() });
-      if (this.onError) this.onError("A player left the room.");
-    }
+
+  /* host: connection lost → grace window, not instant removal */
+  _peerDropped(conn) {
+    const entry = this.conns.get(conn.peer);
+    if (!entry) return;
+    this.conns.delete(conn.peer);
+    const p = this.players.get(entry.sid);
+    if (!p || p.disconnectedAt != null) return;
+    p.disconnectedAt = nowMs();
+    p.ping = null;
+    this._emitPlayers();
+    this._sys(p.name + " disconnected — reconnecting…");
+    const sid = entry.sid;
+    const to = setTimeout(() => {
+      this._graceTimers.delete(sid);
+      const pl = this.players.get(sid);
+      if (pl && pl.disconnectedAt != null) this._removePlayer(sid, "left after grace");
+    }, CONFIG.RECONNECT_GRACE * 1000);
+    this._graceTimers.set(sid, to);
   }
+
+  _removePlayer(sid, why) {
+    const p = this.players.get(sid);
+    const to = this._graceTimers.get(sid);
+    if (to) { clearTimeout(to); this._graceTimers.delete(sid); }
+    // close any live conn for this sid
+    for (const [pid, e] of this.conns) if (e.sid === sid) { try { e.conn.close(); } catch (x) {} this.conns.delete(pid); }
+    this.players.delete(sid);
+    this.lastStates.delete(sid);
+    this._lastD.delete(sid); this._lastDT.delete(sid);
+    this.strikes.delete(sid);
+    this._emitPlayers();
+    this.broadcast({ t: "players", list: this._playerListArr() });
+    if (p) this._sys(p.name + " left the room" + (why ? " (" + why + ")" : "") + ".");
+  }
+
+  _sys(text) {
+    this.broadcast({ t: "sys", text });
+    if (this.onChat) this.onChat({ sys: true, text });
+  }
+
+  /* ---------------- host: the join gate ---------------- */
   _handleGuestMessage(conn, data) {
     if (!data || !data.t) return;
     switch (data.t) {
-      case "hello":
-        if (this.players.size >= MAX_PLAYERS) { conn.send({ t: "full" }); return; }
-        this.players.set(conn.peer, {
-          id: conn.peer, name: (data.name || "Player").slice(0, 12),
-          vehicle: VEHICLES[data.vehicle] ? data.vehicle : "Car", ready: true, isHost: false, ping: null,
+      case "hello": {
+        // Order: locked → password → token restore → capacity → name validity+uniqueness
+        const deny = (reason) => {
+          try { conn.send({ t: "denied", reason }); setTimeout(() => { try { conn.close(); } catch (e) {} }, 300); } catch (e) {}
+        };
+        if (this.locked) { deny("locked"); return; }
+
+        // restore path (reconnect / rejoin after reload / after host transfer)
+        const token = (typeof data.token === "string") ? data.token.slice(0, 16) : null;
+        if (token && this.players.has(token)) {
+          const p = this.players.get(token);
+          // duplicate active session guard: same sid already connected elsewhere
+          for (const e of this.conns.values()) {
+            if (e.sid === token && e.conn !== conn && e.conn.open) { deny("dupsession"); return; }
+          }
+          // re-key the connection and refresh the roster entry
+          for (const [pid, e] of this.conns) if (e.sid === token) this.conns.delete(pid);
+          this.conns.set(conn.peer, { conn, sid: token });
+          p.peerId = conn.peer; p.disconnectedAt = null;
+          const to = this._graceTimers.get(token);
+          if (to) { clearTimeout(to); this._graceTimers.delete(token); }
+          conn.send({ t: "welcome", map: this.selectedMap, players: this._playerListArr(),
+                      locked: this.locked, hasPass: !!this.password });
+          this.broadcast({ t: "players", list: this._playerListArr() });
+          this._emitPlayers();
+          this._sys(p.name + " reconnected.");
+          this._setWire(conn);
+          return;
+        }
+
+        // password check (rate-limited)
+        if (this.password) {
+          let n = this._passN.get(conn.peer) || 0;
+          if (n >= CONFIG.PASS_ATTEMPTS) { deny("toomany"); return; }
+          this._passN.set(conn.peer, n + 1);
+          if (data.pass !== this.password) { deny("password"); return; }
+        }
+
+        if (this.players.size >= CONFIG.MAX_PLAYERS) { deny("full"); return; }
+        const v = validateName(data.name);
+        if (!v.ok) { deny("badname"); return; }
+        const lower = v.name.toLowerCase();
+        for (const p of this.players.values()) {
+          if (p.name.toLowerCase() === lower) { deny("name"); return; }
+        }
+
+        const sid = token || randomHex(12);
+        this.conns.set(conn.peer, { conn, sid });
+        this.players.set(sid, {
+          sid, peerId: conn.peer, name: v.name,
+          vehicle: VEHICLES[data.vehicle] ? data.vehicle : "Car",
+          isHost: false, ping: null, disconnectedAt: null,
         });
         this._emitPlayers();
-        conn.send({ t: "welcome", map: this.selectedMap, players: this._playerListArr() });
+        conn.send({ t: "welcome", map: this.selectedMap, players: this._playerListArr(),
+                    locked: this.locked, hasPass: !!this.password, yourSid: sid });
         this.broadcast({ t: "players", list: this._playerListArr() }, conn.peer);
+        this._sys(v.name + " joined the room.");
+        this._setWire(conn);
         break;
+      }
       case "vehicle": {
-        const p = this.players.get(conn.peer);
+        const sid = this._sidOf(conn);
+        const p = sid && this.players.get(sid);
         if (p && VEHICLES[data.vehicle]) {
           p.vehicle = data.vehicle;
           this._emitPlayers();
@@ -503,48 +714,168 @@ class NetManager {
         }
         break;
       }
-      case "state":
-        this.lastStates.set(conn.peer, data.s);
-        if (this.onWorldUpdate) this.onWorldUpdate(conn.peer, data.s);
-        this.broadcast({ t: "peerstate", id: conn.peer, s: data.s }, conn.peer);
+      case "state": {
+        const sid = this._sidOf(conn);
+        if (!sid || !data.s) return;
+        // ROADGUARD layer 4: speed-bound validation on reported distance.
+        const p = this.players.get(sid);
+        const maxV = VEHICLES[(p && p.vehicle) || "Car"].maxSpeed;
+        const tNow = nowMs();
+        const prevD = this._lastD.has(sid) ? this._lastD.get(sid) : data.s.d;
+        const prevT = this._lastDT.has(sid) ? this._lastDT.get(sid) : tNow;
+        const dtSec = Math.max(0.016, (tNow - prevT) / 1000);
+        if (!deltaOk(maxV, dtSec, data.s.d - prevD)) {
+          this._strike(sid, "impossible speed");
+          return; // reject the packet entirely
+        }
+        this._lastD.set(sid, data.s.d); this._lastDT.set(sid, tNow);
+        this.lastStates.set(sid, data.s);
+        if (this.onWorldUpdate) this.onWorldUpdate(sid, data.s);
+        this.broadcast({ t: "peerstate", id: sid, s: data.s }, conn.peer);
         break;
-      case "finish":
-        if (this._onGuestFinish) this._onGuestFinish(conn.peer, data);
+      }
+      case "finish": {
+        const sid = this._sidOf(conn);
+        if (!sid || !this._onGuestFinish) return;
+        // ROADGUARD: finish must be plausible vs the host's own race clock + distance.
+        const st = this.lastStates.get(sid) || {};
+        if (!validFinishMsg(Game.raceTime, data.time, st.d != null ? st.d : 0, FINISH_DISTANCE)) {
+          this._strike(sid, "implausible finish");
+          return;
+        }
+        this._onGuestFinish(sid, data);
         break;
+      }
+      case "pkc": { // pickup claim — host validates and atomically awards
+        const sid = this._sidOf(conn);
+        const pk = Game.world && Game.world.pickups[data.id];
+        if (!sid || !pk || pk.taken || Game.state !== "racing") return;
+        const st = this.lastStates.get(sid) || {};
+        if (Math.abs((st.x != null ? st.x : 0) - pk.x) > 220) { this._strike(sid, "fake pickup"); return; }
+        pk.taken = true;
+        this.broadcast({ t: "pk", id: data.id, by: sid }); // recipient applies the effect
+        break;
+      }
+      case "chat": {
+        const sid = this._sidOf(conn);
+        const p = sid && this.players.get(sid);
+        if (!p) return;
+        let text = String(data.text || "").slice(0, CONFIG.CHAT_MAX_LEN).trim();
+        if (!text) return;
+        let lim = this._chatL.get(sid);
+        if (!lim) { lim = new RateLimiter(CONFIG.CHAT_COOLDOWN_MS); this._chatL.set(sid, lim); }
+        if (!lim.allow()) return;
+        if (p._lastMsg === text && nowMs() - (p._lastMsgT || 0) < 3000) return; // duplicate throttle
+        p._lastMsg = text; p._lastMsgT = nowMs();
+        this.broadcast({ t: "chat", sid, name: p.name, text, ts: Date.now() });
+        if (this.onChat) this.onChat({ name: p.name, text, ts: Date.now() });
+        break;
+      }
+      case "emote": {
+        const sid = this._sidOf(conn);
+        const p = sid && this.players.get(sid);
+        if (!p || !EMOTES.includes(data.code)) return;
+        let lim = this._emoteL.get(sid);
+        if (!lim) { lim = new RateLimiter(CONFIG.EMOTE_COOLDOWN_MS); this._emoteL.set(sid, lim); }
+        if (!lim.allow()) return;
+        this.broadcast({ t: "emote", sid, name: p.name, code: data.code });
+        if (this.onEmote) this.onEmote({ sid, name: p.name, code: data.code });
+        break;
+      }
+      case "ping": {
+        if (typeof data.ts === "number") { try { conn.send({ t: "pong", ts: data.ts }); } catch (e) {} }
+        break;
+      }
       case "pong": {
-        if (typeof data.ts !== "number") break;
-        const p = this.players.get(conn.peer);
-        if (p) {
-          p.ping = Math.round(performance.now() - data.ts);
+        const sid = this._sidOf(conn);
+        const p = sid && this.players.get(sid);
+        if (p && typeof data.ts === "number") {
+          p.ping = Math.round(nowMs() - data.ts);
           this.broadcast({ t: "players", list: this._playerListArr() });
         }
         break;
       }
     }
   }
+
+  _setWire(conn) {
+    // reconnect handling wire for restored/accepted guests
+    conn.on("close", () => this._peerDropped(conn));
+  }
+  _sidOf(conn) {
+    const e = this.conns.get(conn.peer);
+    return e ? e.sid : null;
+  }
+
+  /* ROADGUARD strikes: thresholds, not instant bans; poor networks get slack. */
+  _strike(sid, why) {
+    let s = this.strikes.get(sid) || { n: 0, lastT: 0 };
+    const t = nowMs();
+    if (t - s.lastT > 10000) s.n = 0; // decay after 10 s clean
+    s.n++; s.lastT = t;
+    this.strikes.set(sid, s);
+    const p = this.players.get(sid);
+    if (s.n >= CONFIG.STRIKES_KICK && p) {
+      this._sys("RoadGuard: removed " + p.name + " (" + why + ").");
+      const e = Array.from(this.conns.values()).find(x => x.sid === sid);
+      if (e) { try { e.conn.send({ t: "kicked", reason: "suspicious data" }); } catch (x) {} }
+      this._removePlayer(sid, "RoadGuard");
+    }
+  }
+
+  /* ---------------- guest side ---------------- */
   _handleHostMessage(data) {
     if (!data || !data.t) return;
     switch (data.t) {
       case "welcome":
         this.selectedMap = data.map;
-        this.players = new Map(data.players.map(p => [p.id, p]));
+        this.players = new Map(data.players.map(p => [p.sid, p]));
+        this.locked = !!data.locked;
+        this.hasPass = !!data.hasPass;
+        if (data.yourSid && !this.mySid) this.mySid = data.yourSid;
         if (this._joinSettle) { this._joinSettle.ok(); this._joinSettle = null; }
+        this._setConnState("connected");
         if (this.onPlayersChanged) this.onPlayersChanged(data.players);
         if (this.onMapChanged) this.onMapChanged(data.map);
+        if (this.onRoomCfg) this.onRoomCfg(this.locked, this.hasPass);
         break;
       case "players":
-        this.players = new Map(data.list.map(p => [p.id, p]));
+        this.players = new Map(data.list.map(p => [p.sid, p]));
         if (this.onPlayersChanged) this.onPlayersChanged(data.list);
         break;
       case "map":
         this.selectedMap = data.map;
         if (this.onMapChanged) this.onMapChanged(data.map);
         break;
+      case "roomcfg":
+        this.locked = !!data.locked; this.hasPass = !!data.hasPass;
+        if (this.onRoomCfg) this.onRoomCfg(this.locked, this.hasPass);
+        break;
       case "start":
+        this._stopReconnect();
         if (this.onRaceStart) this.onRaceStart(data.seed, data.map);
+        break;
+      case "go":
+        this._setConnState("connected");
+        if (this.onGo) this.onGo();
         break;
       case "peerstate":
         if (this.onWorldUpdate) this.onWorldUpdate(data.id, data.s);
+        break;
+      case "pos":
+        if (this.onPositions) this.onPositions(data.list);
+        break;
+      case "pk":
+        if (this.onPickup) this.onPickup(data.id, data.by);
+        break;
+      case "chat":
+        if (this.onChat) this.onChat({ name: data.name, text: data.text, ts: data.ts });
+        break;
+      case "sys":
+        if (this.onChat) this.onChat({ sys: true, text: data.text });
+        break;
+      case "emote":
+        if (this.onEmote) this.onEmote({ sid: data.sid, name: data.name, code: data.code });
         break;
       case "leaderboard":
         if (this.onLeaderboard) this.onLeaderboard(data.list);
@@ -557,48 +888,166 @@ class NetManager {
           try { this.hostConn.send({ t: "pong", ts: data.ts }); } catch (e) {}
         }
         break;
+      case "pong":
+        if (typeof data.ts === "number") this.rtt = Math.max(1, Math.round(nowMs() - data.ts));
+        break;
+      case "denied":
+        if (this._joinSettle) { this._joinSettle.err(data.reason || "denied"); this._joinSettle = null; }
+        break;
       case "full":
         if (this._joinSettle) { this._joinSettle.err("full"); this._joinSettle = null; }
         try { this.hostConn.close(); } catch (e) {}
         break;
+      case "kicked":
+        this._kicked = true;
+        if (this.onKicked) this.onKicked(data.reason || "removed by host");
+        break;
+      case "xfer":
+        if (this.onHostTransfer) this.onHostTransfer(data.to, data.toPeerId);
+        break;
     }
   }
+
   _playerListArr() { return Array.from(this.players.values()); }
   _emitPlayers() { if (this.onPlayersChanged) this.onPlayersChanged(this._playerListArr()); }
+
+  /* host: room configuration (server-authorized because only the host executes it) */
+  setPassword(pw) {
+    if (!this.isHost) return;
+    this.password = (pw || "").toString().slice(0, 24);
+    this.broadcast({ t: "roomcfg", locked: this.locked, hasPass: !!this.password });
+    if (this.onRoomCfg) this.onRoomCfg(this.locked, !!this.password);
+    this._sys(this.password ? "Room password set." : "Room password removed.");
+  }
+  setLocked(v) {
+    if (!this.isHost) return;
+    this.locked = !!v;
+    this.broadcast({ t: "roomcfg", locked: this.locked, hasPass: !!this.password });
+    if (this.onRoomCfg) this.onRoomCfg(this.locked, !!this.password);
+    this._sys(this.locked ? "Room locked — no new players." : "Room unlocked.");
+  }
+  kick(sid) {
+    if (!this.isHost) return;
+    const p = this.players.get(sid);
+    if (!p || p.isHost) return;
+    const e = Array.from(this.conns.values()).find(x => x.sid === sid);
+    if (e) { try { e.conn.send({ t: "kicked", reason: "removed by host" }); } catch (x) {} }
+    this._removePlayer(sid, "kicked by host");
+  }
+
+  /* Host transfer — lobby only. The successor keeps the roster; guests reconnect
+     to the successor's peer id (announced in the message). */
+  transferHost(sid) {
+    if (!this.isHost) return;
+    const p = this.players.get(sid);
+    if (!p || p.isHost || !p.peerId) return;
+    this.broadcast({ t: "xfer", to: sid, toPeerId: p.peerId });
+    // give guests a moment to receive it, then step down
+    setTimeout(() => { try { this.destroy(); } catch (e) {} }, 800);
+  }
+
   setMap(mapName) {
     this.selectedMap = mapName;
     if (this.isHost) this.broadcast({ t: "map", map: mapName });
   }
   setMyVehicle(vehicle) {
-    const me = this.players.get(this.myId);
+    const me = this.players.get(this.mySid);
     if (me) me.vehicle = vehicle;
     if (this.isHost) {
       this._emitPlayers();
       this.broadcast({ t: "players", list: this._playerListArr() });
     } else if (this.hostConn && this.hostConn.open) this.hostConn.send({ t: "vehicle", vehicle });
   }
+
+  /* Authoritative race start: host broadcasts 'start' (seed+map) then 'go' 3 s later.
+     Clients animate the countdown locally but movement unlocks only on 'go'. */
   startRace() {
     if (!this.isHost) return;
     const seed = Math.floor(Math.random() * 999999) + 1;
-    this.raceRoster = this._playerListArr().map(p => p.id);
+    this.raceRoster = this._playerListArr().filter(p => p.disconnectedAt == null).map(p => p.sid);
     this.finishList = [];
     this.lastStates.clear();
+    this._lastD.clear(); this._lastDT.clear();
+    this.locked = true; // no joins mid-race
     this.broadcast({ t: "start", seed, map: this.selectedMap });
     if (this.onRaceStart) this.onRaceStart(seed, this.selectedMap);
+    setTimeout(() => {
+      if (this._destroyed) return;
+      this.broadcast({ t: "go" });
+      if (this.onGo) this.onGo();
+    }, 3000);
   }
+
+  broadcastPositions() {
+    if (!this.isHost || this._destroyed) return;
+    // Standings from finishList + lastStates + own live distance → authoritative.
+    const entries = [];
+    for (const sid of this.raceRoster) {
+      if (!this.players.has(sid)) continue;
+      const p = this.players.get(sid);
+      const f = this.finishList.find(x => x.id === sid);
+      if (f) entries.push({ id: sid, d: f.distance, f: 1, t: f.time, n: p.name });
+      else {
+        const st = (sid === this.mySid && Game.local)
+          ? { d: Math.round(Game.local.distance), x: Math.round(Game.local.x) }
+          : (this.lastStates.get(sid) || { d: 0, x: 0 });
+        entries.push({ id: sid, d: st.d || 0, f: 0, t: null, n: p.name });
+      }
+    }
+    entries.sort((a, b) => (b.f - a.f) || (b.f ? a.t - b.t : b.d - a.d));
+    entries.forEach((e, i) => { e.p = i + 1; });
+    this.broadcast({ t: "pos", list: entries });
+    if (this.onPositions) this.onPositions(entries);
+  }
+
   sendState(s) {
     if (this.isHost) {
-      this.lastStates.set(this.myId, s);
-      if (this.onWorldUpdate) this.onWorldUpdate(this.myId, s);
-      this.broadcast({ t: "peerstate", id: this.myId, s });
-    } else if (this.hostConn && this.hostConn.open) this.hostConn.send({ t: "state", s });
+      this.lastStates.set(this.mySid, s);
+      if (this.onWorldUpdate) this.onWorldUpdate(this.mySid, s);
+      this.broadcast({ t: "peerstate", id: this.mySid, s });
+    } else if (this.hostConn && this.hostConn.open) {
+      try { this.hostConn.send({ t: "state", s }); } catch (e) {}
+    }
   }
   sendFinish(payload) {
-    if (this.isHost) { if (this._onGuestFinish) this._onGuestFinish(this.myId, payload); }
-    else if (this.hostConn && this.hostConn.open) this.hostConn.send(Object.assign({ t: "finish" }, payload));
+    if (this.isHost) { if (this._onGuestFinish) this._onGuestFinish(this.mySid, payload); }
+    else if (this.hostConn && this.hostConn.open) {
+      try { this.hostConn.send(Object.assign({ t: "finish" }, payload)); } catch (e) {}
+    }
+  }
+  claimPickup(id) {
+    if (this.hostConn && this.hostConn.open) {
+      try { this.hostConn.send({ t: "pkc", id }); } catch (e) {}
+    }
+  }
+  sendChat(text) {
+    if (this.isHost) {
+      // host moderates itself through the same rules
+      let t2 = String(text || "").slice(0, CONFIG.CHAT_MAX_LEN).trim();
+      if (!t2) return;
+      let lim = this._chatL.get(this.mySid);
+      if (!lim) { lim = new RateLimiter(CONFIG.CHAT_COOLDOWN_MS); this._chatL.set(this.mySid, lim); }
+      if (!lim.allow()) return;
+      this.broadcast({ t: "chat", sid: this.mySid, name: this.myName, text: t2, ts: Date.now() });
+      if (this.onChat) this.onChat({ name: this.myName, text: t2, ts: Date.now() });
+    } else if (this.hostConn && this.hostConn.open) {
+      try { this.hostConn.send({ t: "chat", text }); } catch (e) {}
+    }
+  }
+  sendEmote(code) {
+    if (this.isHost) {
+      let lim = this._emoteL.get(this.mySid);
+      if (!lim) { lim = new RateLimiter(CONFIG.EMOTE_COOLDOWN_MS); this._emoteL.set(this.mySid, lim); }
+      if (!lim.allow()) return;
+      this.broadcast({ t: "emote", sid: this.mySid, name: this.myName, code });
+      if (this.onEmote) this.onEmote({ sid: this.mySid, name: this.myName, code });
+    } else if (this.hostConn && this.hostConn.open) {
+      try { this.hostConn.send({ t: "emote", code }); } catch (e) {}
+    }
   }
   returnAllToLobby() {
     if (!this.isHost) return;
+    this.locked = false;
     this.broadcast({ t: "lobby" });
     if (this.onReturnToLobby) this.onReturnToLobby();
   }
@@ -607,17 +1056,20 @@ class NetManager {
     this.broadcast({ t: "leaderboard", list });
     if (this.onLeaderboard) this.onLeaderboard(list);
   }
-  broadcast(obj, excludeId) {
-    for (const [id, conn] of this.conns) {
-      if (id === excludeId) continue;
-      if (conn.open) { try { conn.send(obj); } catch (e) {} }
+  broadcast(obj, excludePeerId) {
+    for (const [pid, e] of this.conns) {
+      if (pid === excludePeerId) continue;
+      if (e.conn.open) { try { e.conn.send(obj); } catch (x) {} }
     }
   }
-  joinRoom(code, name) {
+
+  joinRoom(code, name, pass) {
     this.myName = name || "Player";
     this.isHost = false;
+    this._joinPass = pass || "";
     return this._joinAttempt(code, 0);
   }
+
   _joinAttempt(code, attempt) {
     const target = "roadrush-" + code.trim().toUpperCase();
     return new Promise((resolve, reject) => {
@@ -627,6 +1079,7 @@ class NetManager {
       };
       settle.to = setTimeout(() => settle.err("timeout"), 10000);
       this._joinSettle = settle;
+      this._setConnState("connecting");
       const retryNetwork = () => {
         if (settle.done || this._destroyed) return;
         if (attempt < 1) {
@@ -645,29 +1098,87 @@ class NetManager {
       this.peer.on("disconnected", () => {
         if (!settle.done && !this._destroyed) { try { this.peer.reconnect(); } catch (e) {} }
       });
-      this.peer.on("open", (id) => {
-        this.myId = id;
+      this.peer.on("open", () => {
+        this.hostPeerId = target;
+        const sid = sidFor(code.trim().toUpperCase());
         const conn = this.peer.connect(target, { reliable: true });
         this.hostConn = conn;
-        conn.on("open", () => conn.send({ t: "hello", name: this.myName, vehicle: save.vehicle }));
+        conn.on("open", () => {
+          this.mySid = sid;
+          conn.send({ t: "hello", name: this.myName, vehicle: save.vehicle, token: sid, pass: this._joinPass });
+          this._startGuestPing();
+        });
         conn.on("data", (data) => this._handleHostMessage(data));
         conn.on("close", () => {
           if (!settle.done) settle.err("closed");
-          else if (this.onHostLeft) this.onHostLeft();
+          else this._onHostConnLost();
         });
       });
     });
   }
+
+  /* guest: measure REAL round-trip latency to the host every 2 s */
+  _startGuestPing() {
+    this._stopGuestPing();
+    this._guestPing = setInterval(() => {
+      if (this._destroyed || !this.hostConn || !this.hostConn.open) return;
+      try { this.hostConn.send({ t: "ping", ts: nowMs() }); } catch (e) {}
+    }, 2000);
+  }
+  _stopGuestPing() { if (this._guestPing) { clearInterval(this._guestPing); this._guestPing = null; } }
+
+  /* guest: host connection lost mid-room → reconnect loop, identity preserved */
+  _onHostConnLost() {
+    if (this._destroyed || this._kicked) return;
+    this._setConnState("reconnecting");
+    this._startReconnect();
+  }
+  _startReconnect() {
+    if (this._destroyed || this._reconn) return;
+    this._reconn = { attempts: 0, timer: setInterval(() => this._reconnTick(), 2000) };
+    this._reconnTick();
+  }
+  _reconnTick() {
+    if (!this._reconn || this._destroyed || this._kicked) return;
+    if (this.hostConn && this.hostConn.open) { this._stopReconnect(); return; }
+    if (this._reconn.attempts >= CONFIG.RECONNECT_ATTEMPTS) {
+      this._stopReconnect();
+      this._setConnState("disconnected");
+      if (this.onHostLeft) this.onHostLeft();
+      return;
+    }
+    this._reconn.attempts++;
+    try {
+      const conn = this.peer.connect(this.hostPeerId, { reliable: true });
+      conn.on("open", () => {
+        this.hostConn = conn;
+        this._reconn.attempts = 0;
+        conn.send({ t: "hello", name: this.myName, vehicle: save.vehicle, token: this.mySid, pass: "" });
+        this._startGuestPing();
+        conn.on("data", (data) => this._handleHostMessage(data));
+        conn.on("close", () => this._onHostConnLost());
+      });
+      setTimeout(() => { if (!conn.open) { try { conn.close(); } catch (e) {} } }, 1800);
+    } catch (e) {}
+  }
+  _stopReconnect() {
+    if (this._reconn) { clearInterval(this._reconn.timer); this._reconn = null; }
+  }
+
   destroy() {
     this._destroyed = true;
-    this._stopPingLoop();
+    this._stopPingLoop(); this._stopGuestPing(); this._stopReconnect();
+    for (const to of this._graceTimers.values()) clearTimeout(to);
+    this._graceTimers.clear();
     try { if (this.hostConn) this.hostConn.close(); } catch (e) {}
-    for (const [, c] of this.conns) { try { c.close(); } catch (e) {} }
+    for (const e of this.conns.values()) { try { e.conn.close(); } catch (x) {} }
     try { if (this.peer) this.peer.destroy(); } catch (e) {}
     this.peer = null; this.hostConn = null;
     this.conns.clear(); this.players.clear(); this.lastStates.clear();
+    this._lastD.clear(); this._lastDT.clear(); this.strikes.clear();
     this.raceRoster = []; this.finishList = [];
     this.isHost = false; this.roomCode = null; this._joinSettle = null;
+    this._setConnState("offline");
   }
 }
 
@@ -686,16 +1197,19 @@ function drawTerrain(ctx, terrain, camX, camY, W, H) {
   const grad = ctx.createLinearGradient(0, 0, 0, H);
   grad.addColorStop(0, def.sky[0]); grad.addColorStop(1, def.sky[1]);
   ctx.fillStyle = grad; ctx.fillRect(0, 0, W, H);
+  const q = save.quality;
+  const starN = q === "low" ? 20 : 60;
+  const snowN = q === "low" ? 12 : 30;
   if (def.label === "Moon") {
     ctx.fillStyle = "#e8e8f2";
-    for (let i = 0; i < 60; i++) {
+    for (let i = 0; i < starN; i++) {
       const sx = (i * 137.5) % W, sy = (i * 91.7) % (H * 0.65);
       ctx.fillRect(sx, sy, (i % 7 === 0) ? 2 : 1.4, (i % 7 === 0) ? 2 : 1.4);
     }
   } else if (def.label === "Snow") {
     ctx.fillStyle = "#ffffff";
     const t = performance.now() * 0.03;
-    for (let i = 0; i < 30; i++) {
+    for (let i = 0; i < snowN; i++) {
       const sx = ((i * 173 + t * (0.4 + (i % 3) * 0.3)) % (W + 40)) - 20;
       const sy = (i * 67 + t * 0.15) % H;
       ctx.beginPath(); ctx.arc(sx, sy, 1.8, 0, 6.283); ctx.fill();
@@ -736,7 +1250,7 @@ function drawTerrain(ctx, terrain, camX, camY, W, H) {
   }
 }
 function drawScenery(ctx, terrain, camX, camY, W, H, mapName) {
-  const step = 230;
+  const step = save.quality === "low" ? 340 : 230; // low quality = sparser scenery
   const first = Math.floor((camX - 100) / step) * step;
   for (let wx = first; wx < camX + W + step; wx += step) {
     if (wx < 400) continue;
@@ -863,6 +1377,25 @@ function drawVehicle(ctx, p, camX, camY, alpha) {
     ctx.fillText(p.name, cx, cy - p.h / 2 - 12);
   }
 }
+/* emote bubbles drawn above the vehicle that sent them */
+function drawEmoteBubbles(ctx, camX, camY) {
+  ctx.font = "bold 12px sans-serif"; ctx.textAlign = "center";
+  for (const b of Game.bubbles) {
+    const pl = playerBySid(b.sid);
+    if (!pl) continue;
+    const cx = pl.x - camX, cy = pl.y - camY - pl.h / 2 - 26;
+    const tw = ctx.measureText(b.text).width;
+    ctx.fillStyle = "#000d";
+    roundRect(ctx, cx - tw / 2 - 8, cy - 12, tw + 16, 22, 8); ctx.fill();
+    ctx.strokeStyle = "#ffffff44"; ctx.lineWidth = 1; ctx.stroke();
+    ctx.fillStyle = "#fff";
+    ctx.fillText(b.text, cx, cy + 4);
+  }
+}
+function playerBySid(sid) {
+  if (Game.net && Game.net.mySid === sid) return Game.local;
+  return Game.ghosts.get(sid) || null;
+}
 function drawPickup(ctx, pk, camX, camY, terrain, W) {
   if (pk.taken) return;
   const x = pk.x - camX;
@@ -923,11 +1456,14 @@ function drawObstacle(ctx, o, camX, camY, terrain, W) {
 let ctx = null, W = 0, H = 0;
 const isTouch = (window.matchMedia && matchMedia("(pointer: coarse)").matches) || ("ontouchstart" in window);
 document.body.classList.add(isTouch ? "is-touch" : "is-desktop");
+if (save.reducedMotion) document.body.classList.add("no-motion");
+
+const EMOTES = ["GO!", "NICE!", "GG", "LOL", "WOW!", "WAIT!", "FUEL!", "NITRO!", "CLUTCH!"];
 
 const input = { accel: false, brake: false, left: false, right: false };
 let nitroQueued = false, jumpQueued = false;
 let toastT = 0, toastMsg = "";
-let pendingRoom = null;
+let pendingRoom = null, DEBUG_MODE = false;
 
 const Game = {
   mode: null, state: "menu", mapName: "Highway",
@@ -938,15 +1474,18 @@ const Game = {
   music: new MusicEngine(),
   cam: { x: 0, y: 0, shake: 0 },
   raceTime: 0, countdownT: 0, goT: 0, lastCountNum: 4, hintT: 0,
+  awaitingGo: false,
   afterFinishTimer: 0, stalledFor: 0,
   hostEndStarted: false, hostEndTimer: 0,
+  posAcc: 0, posList: null,
+  bubbles: [],
   waiting: false,
-  net: null, netAcc: 0, hudAcc: 0, listTick: 0,
+  net: null, netAcc: 0, hudAcc: 0, listTick: 0, dbgAcc: 0, fpsAvg: 60,
   lastT: 0, paused: false,
 };
 
-const SCREENS = ["screen-home", "screen-play", "screen-vehicle", "screen-map",
-                 "screen-join", "screen-lobby", "screen-settings", "screen-race"];
+const SCREENS = ["screen-home", "screen-play", "screen-vehicle", "screen-map", "screen-join",
+  "screen-lobby", "screen-settings", "screen-race", "screen-howto", "screen-feedback"];
 function showScreen(id) {
   for (const s of SCREENS) $(s).classList.add("hidden");
   if (id) $(id).classList.remove("hidden");
@@ -956,7 +1495,7 @@ function currentScreen() {
   return null;
 }
 function hideOverlays() {
-  ["overlay-pause", "overlay-result", "overlay-rotate", "overlay-qr"].forEach(o => $(o).classList.add("hidden"));
+  ["overlay-pause", "overlay-result", "overlay-rotate", "overlay-qr", "emotePanel"].forEach(o => $(o).classList.add("hidden"));
 }
 function hudToast(msg) { toastMsg = msg; toastT = 2.4; }
 function resizeCanvas() {
@@ -974,7 +1513,6 @@ function checkOrientation() {
   $("overlay-rotate").classList.toggle("hidden", !(isTouch && portrait && currentScreen() === "screen-race"));
 }
 
-/* wake lock so the host's phone doesn't sleep and drop the room */
 let wakeLock = null;
 async function requestWakeLock() {
   try { if ("wakeLock" in navigator) wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
@@ -992,22 +1530,23 @@ function startRace(seed) {
   Game.particles = new ParticleSystem();
   Game.raceTime = 0; Game.afterFinishTimer = 0; Game.stalledFor = 0;
   Game.hostEndStarted = false; Game.hostEndTimer = 0;
-  Game.waiting = false; toastT = 0;
+  Game.waiting = false; toastT = 0; Game.posList = null; Game.bubbles = [];
   Game.countdownT = 3.0; Game.lastCountNum = 4; Game.goT = 0; Game.hintT = 6;
+  Game.awaitingGo = Game.mode !== "single";   // multiplayer waits for the host's GO
   Game.state = "countdown"; Game.paused = false;
   Game.cam = { x: START_X - W * 0.35, y: 0, shake: 0 };
 
-  Game.local = new RacePlayer(save.vehicle, Game.terrain, { id: "local", name: save.name, fuelMult: mapDef.fuelMult });
+  Game.local = new RacePlayer(save.vehicle, Game.terrain,
+    { id: "local", name: save.name, fuelMult: mapDef.fuelMult, sid: Game.net ? Game.net.mySid : null });
   Game.players = [Game.local];
   Game.ghosts.clear();
   Game.bots = [];
 
   if (Game.mode === "single") {
-    // 5 bots → 6 racers, so the top-5 list is meaningful.
-    const names = ["Rex", "Mia", "Zig", "Ava", "Kai"];
+    const names = ["Rex", "Mia", "Zig"];
     const vehs = Object.keys(VEHICLES);
-    for (let i = 0; i < 5; i++) {
-      const skill = 0.82 + (i / 5) * 0.16 + Math.random() * 0.04;
+    for (let i = 0; i < 3; i++) {
+      const skill = 0.82 + (i / 3) * 0.16 + Math.random() * 0.04;
       const b = new RacePlayer(vehs[i % 3], Game.terrain,
         { id: "bot" + i, name: names[i], isBot: true, fuelMult: mapDef.fuelMult });
       b.accelPower *= skill; b.maxSpeed *= skill; b.fuelUse *= 0.9;
@@ -1017,22 +1556,22 @@ function startRace(seed) {
     }
   } else if (Game.net) {
     for (const p of Game.net._playerListArr()) {
-      if (p.id === Game.net.myId) continue;
+      if (p.sid === Game.net.mySid) continue;
       const v = VEHICLES[p.vehicle] ? p.vehicle : "Car";
-      Game.ghosts.set(p.id, {
-        id: p.id, name: p.name, isRemote: true, vehicleName: v,
+      Game.ghosts.set(p.sid, {
+        sid: p.sid, name: p.name, isRemote: true, vehicleName: v,
         color: VEHICLES[v].color, w: VEHICLES[v].w, h: VEHICLES[v].h,
         x: START_X, y: Game.terrain.heightAt(START_X) - VEHICLES[v].h / 2 - VEHICLES[v].drop,
         angle: 0, tx: START_X, ty: 0, ta: 0,
         nitro: false, finished: false, finishTime: null, distance: 0,
       });
-      Game.players.push(Game.ghosts.get(p.id));
+      Game.players.push(Game.ghosts.get(p.sid));
     }
   }
 
   showScreen("screen-race");
   hideOverlays();
-  $("touchControls").classList.toggle("hidden", !(isTouch || save.pedals)); // platform split
+  $("touchControls").classList.toggle("hidden", !(isTouch || save.pedals));
   $("keyHints").classList.toggle("hidden", isTouch);
   $("keyHints").classList.remove("faded");
   $("raceList").innerHTML = "";
@@ -1042,6 +1581,15 @@ function startRace(seed) {
   Game.music.setEnabled(save.music);
   Game.music.start();
   requestWakeLock();
+}
+
+function beginGo() { // called by host schedule (host) or 'go' message (guest)
+  if (Game.state !== "countdown") return;
+  Game.state = "racing";
+  Game.awaitingGo = false;
+  Game.goT = 0.9;
+  setCountdown("GO!");
+  Game.sfx.play("go");
 }
 
 /* ------------------------------ bot AI ------------------------------ */
@@ -1075,13 +1623,13 @@ function botInput(bot, dt) {
   return inp;
 }
 
-/* ------------------------------ world interactions ------------------------------ */
+/* ------------------------------ pickups (host-atomic in multiplayer) ------------------------------ */
 function applyPickup(p, kind) {
   if (kind === "fuel") {
-    p.fuel = p.fuelCap; // fuel pickup FILLS THE TANK TO FULL
-    if (p === Game.local) Game.sfx.play("fuel");
+    p.fuel = fillFuel(p.fuel, p.fuelCap); // refills to FULL
+    if (p === Game.local) { Game.sfx.play("fuel"); vibrate(15); }
   } else if (kind === "nitro") {
-    p.nitroCharges = Math.min(p.maxNitro, p.nitroCharges + 1);
+    p.nitroCharges = addNitro(p.nitroCharges, p.maxNitro);
     if (p === Game.local) Game.sfx.play("pickup");
   } else {
     p.coins += 1;
@@ -1092,6 +1640,26 @@ function applyPickup(p, kind) {
     Game.particles.emit(p.x, p.y - 10, 6, col, { spread: 80, speed: 120, life: 0.4, size: 2, gravity: 300 });
   }
 }
+function tryPickup(pk) { // called when the LOCAL player overlaps a pickup
+  if (Game.mode === "single" || !Game.net) {           // solo: instant
+    if (!pk.taken) { pk.taken = true; applyPickup(Game.local, pk.kind); }
+  } else if (Game.net.isHost) {                        // host: validate + broadcast + apply
+    if (!pk.taken) {
+      pk.taken = true;
+      Game.net.broadcast({ t: "pk", id: pk.id, by: Game.net.mySid });
+      applyPickup(Game.local, pk.kind);
+    }
+  } else {                                             // guest: claim; host decides
+    if (!pk.taken) { pk.taken = true; Game.net.claimPickup(pk.id); } // optimistic hide, host confirms
+  }
+}
+function onAuthoritativePickup(id, by) { // all clients receive host ruling
+  const pk = Game.world && Game.world.pickups[id];
+  if (!pk || pk.taken) return;
+  pk.taken = true;
+  if (Game.net && by === Game.net.mySid) applyPickup(Game.local, pk.kind); // you won the claim
+}
+
 function hitObstacle(p, o) {
   o.cd = 1.2;
   const massFactor = clamp((p.mass - 0.6) / 1.0, 0, 1);
@@ -1110,7 +1678,7 @@ function updateWorldInteractions(dt) {
     if (o.v) o.x = o.x0 + o.v * Math.max(0, Game.raceTime);
     if (o.cd > 0) o.cd -= dt;
   }
-  const locals = [Game.local].concat(Game.bots);
+  const locals = [Game.local].concat(Game.bots); // bots only exist in solo
   for (const p of locals) {
     if (p.finished) continue;
     for (const pk of Game.world.pickups) {
@@ -1118,7 +1686,10 @@ function updateWorldInteractions(dt) {
       const dx = p.x - pk.x;
       if (dx > 40 || dx < -40) continue;
       const py = Game.terrain.heightAt(pk.x) - 28;
-      if (Math.abs(p.y - py) < 46) { pk.taken = true; applyPickup(p, pk.kind); }
+      if (Math.abs(p.y - py) < 46) {
+        if (p === Game.local) tryPickup(pk);
+        else if (!pk.taken && Game.mode === "single") { pk.taken = true; applyPickup(p, pk.kind); }
+      }
     }
     for (const o of Game.world.obstacles) {
       if (o.cd > 0) continue;
@@ -1130,9 +1701,13 @@ function updateWorldInteractions(dt) {
   }
 }
 
-/* ------------------------------ finishing / leaderboard ------------------------------ */
+/* ------------------------------ finishing / results ------------------------------ */
 function posKey(p) { return p.finished ? 500000 - (p.finishTime || 400) : p.distance; }
 function computePosition() {
+  if (Game.mode !== "single" && Game.posList && Game.net) {
+    const me = Game.posList.find(e => e.id === Game.net.mySid);
+    if (me) return me.p;
+  }
   const racers = Game.players.slice().sort((a, b) => posKey(b) - posKey(a));
   return racers.indexOf(Game.local) + 1;
 }
@@ -1175,8 +1750,6 @@ function buildStandingsEntries() {
     score: computeScore(p.distance * UNIT_TO_M, p.coins, p.finalPlace, p.fuel), me: p === Game.local,
   }));
 }
-function finishSingleRace() { endSingle("RACE COMPLETE"); }
-function gameOver(title) { endSingle(title); }
 function endSingle(title) {
   if (Game.state === "done") return;
   Game.state = "done";
@@ -1185,6 +1758,7 @@ function endSingle(title) {
   const isBest = me && me.score > save.best;
   if (isBest) save.best = me.score;
   save.coins += me ? me.coins : 0;
+  save.firstRun = false;
   persist();
   presentLeaderboard(title,
     `You finished ${fmtPlace(me.place)}${me.time != null ? " — " + fmtTime(me.time) : ""}` +
@@ -1195,20 +1769,20 @@ function checkSingleRaceEnd(dt) {
   if (Game.state !== "racing" || Game.mode !== "single") return;
   if (Game.local.finished) Game.afterFinishTimer += dt;
   const allDone = Game.players.every(p => p.finished);
-  if (allDone || Game.raceTime > RACE_TIMEOUT || (Game.local.finished && Game.afterFinishTimer > 10)) finishSingleRace();
+  if (allDone || Game.raceTime > RACE_TIMEOUT || (Game.local.finished && Game.afterFinishTimer > 10)) endSingle("RACE COMPLETE");
 }
-function hostHandleFinish(id, data) {
-  if (!Game.net.raceRoster.includes(id)) return;
-  if (Game.net.finishList.some(f => f.id === id)) return;
-  Game.net.finishList.push({ id, time: data.time, distance: data.distance, coins: data.coins, fuel: data.fuel });
+function hostHandleFinish(sid, data) {
+  if (!Game.net.raceRoster.includes(sid)) return;
+  if (Game.net.finishList.some(f => f.id === sid)) return;
+  Game.net.finishList.push({ id: sid, time: data.time, distance: data.distance, coins: data.coins, fuel: data.fuel });
 }
 function checkHostRaceEnd(dt) {
   if (Game.state !== "racing" || Game.mode !== "host") return;
   const fl = Game.net.finishList;
   if (fl.length > 0 && !Game.hostEndStarted) Game.hostEndStarted = true;
   if (Game.hostEndStarted) Game.hostEndTimer += dt;
-  const active = Game.net.raceRoster.filter(id => Game.net.players.has(id));
-  const allFinished = active.length > 0 && active.every(id => fl.some(f => f.id === id));
+  const active = Game.net.raceRoster.filter(sid => Game.net.players.has(sid));
+  const allFinished = active.length > 0 && active.every(sid => fl.some(f => f.id === sid));
   if (allFinished || (Game.hostEndStarted && Game.hostEndTimer > 45) || Game.raceTime > RACE_TIMEOUT) {
     hostCompileLeaderboard();
   }
@@ -1229,8 +1803,8 @@ function hostCompileLeaderboard() {
     place++;
   }
   const unfinished = Game.net.raceRoster
-    .filter(id => !fl.some(f => f.id === id) && Game.net.players.has(id))
-    .map(id => ({ id, name: (Game.net.players.get(id) || {}).name || "Player", d: ((Game.net.lastStates.get(id) || {}).d) || 0 }))
+    .filter(sid => !fl.some(f => f.id === sid) && Game.net.players.has(sid))
+    .map(sid => ({ id: sid, name: (Game.net.players.get(sid) || {}).name || "Player", d: ((Game.net.lastStates.get(sid) || {}).d) || 0 }))
     .sort((a, b) => b.d - a.d);
   for (const r of unfinished) {
     const distM = Math.round(r.d * UNIT_TO_M);
@@ -1245,7 +1819,7 @@ function checkGuestRaceEnd() {
   if (Game.raceTime > RACE_TIMEOUT + 10) {
     const racers = Game.players.slice().sort((a, b) => posKey(b) - posKey(a));
     const entries = racers.map((p, i) => ({
-      id: p.id, name: p.name, place: i + 1, time: p.finishTime != null ? p.finishTime : null,
+      id: p.sid || p.id, name: p.name, place: i + 1, time: p.finishTime != null ? p.finishTime : null,
       distance: Math.round(p.distance * UNIT_TO_M), coins: p.coins || 0, fuel: Math.round(p.fuel || 0),
       score: computeScore(Math.round(p.distance * UNIT_TO_M), p.coins || 0, i + 1, Math.round(p.fuel || 0)),
     }));
@@ -1273,7 +1847,6 @@ function presentLeaderboard(title, sub, entries, mode) {
       `<span class="rs-chip">Fuel <b>${mine.fuel || 0}%</b></span>` +
       `<span class="rs-chip">Score <b>${Math.round(mine.score).toLocaleString()}</b></span>`;
   } else $("resultStats").innerHTML = "";
-  // podium for the top 3
   const pod = $("podium");
   const p1 = entries.find(e => e.place === 1), p2 = entries.find(e => e.place === 2), p3 = entries.find(e => e.place === 3);
   if (p1) {
@@ -1284,7 +1857,6 @@ function presentLeaderboard(title, sub, entries, mode) {
       `<div class="pname">${escapeHtml(e.me ? "YOU" : e.name)}</div>` +
       `<div class="ptime">${e.time != null ? fmtTime(e.time) : fmtDist(e.distance || 0)}</div></div>`).join("");
   } else { pod.style.display = "none"; pod.innerHTML = ""; }
-  // rows (from 4th place when a podium exists)
   const ul = $("resultBoard");
   ul.innerHTML = "";
   for (const e of entries) {
@@ -1292,7 +1864,7 @@ function presentLeaderboard(title, sub, entries, mode) {
     const li = document.createElement("li");
     if (e.me) li.className = "me";
     const detail = (e.time != null ? fmtTime(e.time) : fmtDist(e.distance || 0)) +
-      " • " + (e.coins || 0) + "🪙 • " + Math.round(e.score).toLocaleString() + " pts";
+      " • " + (e.coins || 0) + " • " + Math.round(e.score).toLocaleString() + " pts";
     li.innerHTML = `<span class="lb-place">${fmtPlace(e.place)}</span>` +
       `<span class="lb-name">${escapeHtml(e.name)}${e.me ? ' <span class="you-tag">(you)</span>' : ""}</span>` +
       `<span class="lb-detail">${detail}</span>`;
@@ -1303,30 +1875,59 @@ function presentLeaderboard(title, sub, entries, mode) {
   $("overlay-result").classList.remove("hidden");
 }
 
-/* ------------------------------ camera / HUD / live standings ------------------------------ */
+/* ------------------------------ camera / HUD / standings ------------------------------ */
 function updateCamera(dt) {
   const p = Game.local;
   if (!p) return;
   Game.cam.x += (p.x - W * 0.35 - Game.cam.x) * Math.min(1, 6 * dt);
   Game.cam.y += (p.y - H * 0.55 - Game.cam.y) * Math.min(1, 4 * dt);
-  Game.cam.shake = Math.max(0, Game.cam.shake - 3.5 * dt);
+  const shakeMult = (save.reducedMotion || save.quality === "low") ? 0 : 1;
+  Game.cam.shake = Math.max(0, Game.cam.shake - 3.5 * dt) * (Game.cam.shake > 0 ? 1 : 0);
+  if (shakeMult === 0) Game.cam.shake = 0;
 }
 function updateRaceList() {
   const el = $("raceList");
   if (!el || Game.players.length < 2) return;
-  const racers = Game.players.slice().sort((a, b) => posKey(b) - posKey(a));
-  const myIdx = racers.indexOf(Game.local);
-  const leadDist = racers[0].distance;
-  const row = (p, i) => {
-    const me = p === Game.local;
-    const gap = p.finished ? "✓ fin" : (i === 0 ? fmtDist(p.distance * UNIT_TO_M) : "+" + fmtDist(Math.max(0, leadDist - p.distance)));
-    return `<div class="rl-row${me ? " me" : ""}"><span class="rl-place">${i + 1}</span>` +
-      `<span class="rl-name">${escapeHtml(me ? "YOU" : (p.name || "?"))}</span><span class="rl-gap">${gap}</span></div>`;
+  let rows;
+  if (Game.mode !== "single" && Game.posList) {
+    rows = Game.posList.map(e => ({ sid: e.id, name: e.n, place: e.p, d: e.d, fin: e.f }));
+  } else {
+    const racers = Game.players.slice().sort((a, b) => posKey(b) - posKey(a));
+    rows = racers.map((p, i) => ({
+      sid: p.sid || p.id, name: p.name, place: i + 1,
+      d: Math.round(p.distance * UNIT_TO_M), fin: p.finished ? 1 : 0,
+    }));
+  }
+  const mySid = Game.net ? Game.net.mySid : "local";
+  const leadD = rows.length ? rows[0].d : 0;
+  const myIdx = rows.findIndex(r => r.sid === mySid);
+  const row = (r) => {
+    const me = r.sid === mySid;
+    const gap = r.fin ? "✓ fin" : (r.place === 1 ? fmtDist(r.d) : "+" + fmtDist(Math.max(0, leadD - r.d)));
+    return `<div class="rl-row${me ? " me" : ""}"><span class="rl-place">${r.place}</span>` +
+      `<span class="rl-name">${escapeHtml(me ? "YOU" : (r.name || "?"))}</span><span class="rl-gap">${gap}</span></div>`;
   };
   let html = "";
-  racers.slice(0, 5).forEach((p, i) => { html += row(p, i); });
-  if (myIdx >= 5) html += '<div class="rl-sep">⋯</div>' + row(Game.local, myIdx);
+  rows.slice(0, 5).forEach(r => { html += row(r); });
+  if (myIdx >= 5) html += '<div class="rl-sep">⋯</div>' + row(rows[myIdx]);
   el.innerHTML = html;
+}
+function updateConnHud() {
+  const chip = $("connChip"), ping = $("pingChip");
+  if (Game.mode === "single" || !Game.net) { chip.textContent = "SOLO"; chip.className = "hud-chip hud-conn"; ping.textContent = "PING —"; ping.className = "ping-chip"; return; }
+  const net = Game.net;
+  let state = net.connState, rtt = net.rtt;
+  if (state === "connected" && rtt > 180) state = "poor";
+  const label = { connected: "ONLINE", connecting: "CONNECTING…", reconnecting: "RECONNECTING", disconnected: "OFFLINE", poor: "POOR CONN", offline: "OFFLINE" }[state] || state.toUpperCase();
+  chip.textContent = label;
+  chip.className = "hud-chip hud-conn " + (state === "connected" ? "ok" : state === "poor" ? "warn" : "bad");
+  const isHost = net.isHost;
+  const shown = isHost ? (Array.from(net.conns.values()).some(e => e.conn.open) ? Math.max(1, rtt || 1) : 1) : rtt;
+  if (!shown || state === "reconnecting") { ping.textContent = (isHost ? "HOST" : "PING —"); ping.className = "ping-chip"; }
+  else {
+    ping.textContent = "PING " + shown + " ms";
+    ping.className = "ping-chip " + (shown < 80 ? "good" : shown < 180 ? "fair" : "poor");
+  }
 }
 function updateHud(dt) {
   Game.hudAcc += dt;
@@ -1349,9 +1950,11 @@ function updateHud(dt) {
   let warn = "";
   if (toastT > 0) warn = toastMsg;
   else if (Game.waiting) warn = "Finished! Waiting for the other players…";
+  else if (Game.awaitingGo) warn = "Waiting for host GO…";
   else if (p.fuel <= 0 && !p.finished) warn = "OUT OF FUEL — coast to a pickup!";
   else if (pct < 20 && !p.finished) warn = "LOW FUEL";
   $("hudWarning").textContent = warn;
+  updateConnHud();
   Game.listTick = (Game.listTick + 1) % 3;
   if (Game.listTick === 0) updateRaceList();
 }
@@ -1375,10 +1978,11 @@ function update(dt) {
       setCountdown(num);
     }
     if (Game.countdownT <= 0) {
-      Game.state = "racing";
-      Game.goT = 0.9;
-      setCountdown("GO!");
-      Game.sfx.play("go");
+      if (Game.mode === "single") beginGo();
+      else if (Game.countdownT < -6) { // failsafe: host died during countdown
+        hudToast("Lost the host — returning to menu");
+        setTimeout(goHome, 1200);
+      }
     }
     for (const p of Game.players) if (p instanceof RacePlayer) p.update(dt, {}, Game.particles, null, false);
   } else {
@@ -1388,7 +1992,6 @@ function update(dt) {
     }
     if (Game.state === "racing") Game.raceTime += dt;
     const raceStarted = Game.state === "racing";
-    // fade desktop key hints after the first seconds
     if (Game.hintT > 0) {
       Game.hintT -= dt;
       if (Game.hintT <= 0 && !isTouch) $("keyHints").classList.add("faded");
@@ -1415,14 +2018,18 @@ function update(dt) {
     if (Game.state === "racing" && Game.mode === "single" && !Game.local.finished) {
       if (Game.local.fuel <= 0 && Math.abs(Game.local.vx) < 15) Game.stalledFor += dt;
       else Game.stalledFor = 0;
-      if (Game.stalledFor > 5) { gameOver("OUT OF FUEL"); return; }
+      if (Game.stalledFor > 5) { endSingle("OUT OF FUEL"); return; }
     }
     if (Game.mode === "single") checkSingleRaceEnd(dt);
-    else if (Game.mode === "host") checkHostRaceEnd(dt);
+    else if (Game.mode === "host") {
+      checkHostRaceEnd(dt);
+      Game.posAcc += dt; // authoritative standings every 0.5 s
+      if (Game.posAcc >= 0.5) { Game.posAcc = 0; Game.net.broadcastPositions(); }
+    }
     else checkGuestRaceEnd();
     if (Game.mode !== "single" && Game.net) {
       Game.netAcc += dt;
-      if (Game.netAcc >= 1 / NET_SEND_HZ) {
+      if (Game.netAcc >= 1 / CONFIG.NET_SEND_HZ) {
         Game.netAcc = 0;
         Game.net.sendState({
           x: Math.round(Game.local.x), y: Math.round(Game.local.y),
@@ -1435,9 +2042,24 @@ function update(dt) {
     Game.sfx.engineUpdate(Game.local.vx, raceStarted && input.accel && !Game.local.finished, Game.local.nitroTimer > 0);
   }
   if (toastT > 0) toastT -= dt;
+  for (const b of Game.bubbles) b.t -= dt;
+  Game.bubbles = Game.bubbles.filter(b => b.t > 0);
   Game.particles.update(dt);
   updateCamera(dt);
   updateHud(dt);
+  if (DEBUG_MODE) updateDebug(dt);
+}
+function updateDebug(dt) {
+  Game.dbgAcc += dt;
+  Game.fpsAvg = Game.fpsAvg * 0.95 + (1 / Math.max(dt, 0.001)) * 0.05;
+  if (Game.dbgAcc < 0.5) return;
+  Game.dbgAcc = 0;
+  const net = Game.net;
+  $("debugPanel").innerHTML =
+    `FPS ${Math.round(Game.fpsAvg)} · state ${Game.state}<br>` +
+    `mode ${Game.mode || "—"} · room ${net ? net.roomCode : "—"} · sid ${net ? net.mySid : "—"}<br>` +
+    `players ${net ? net.players.size : "—"} · conn ${net ? net.connState : "—"} · rtt ${net ? net.rtt : "—"}ms<br>` +
+    `particles ${Game.particles.list.length} · quality ${save.quality}`;
 }
 function render() {
   if (!ctx || !Game.terrain) return;
@@ -1453,6 +2075,7 @@ function render() {
   for (const g of Game.ghosts.values()) drawVehicle(ctx, g, Game.cam.x, Game.cam.y, 0.5);
   for (const b of Game.bots) drawVehicle(ctx, b, Game.cam.x, Game.cam.y, 1);
   if (Game.local) drawVehicle(ctx, Game.local, Game.cam.x, Game.cam.y, 1);
+  drawEmoteBubbles(ctx, Game.cam.x, Game.cam.y);
   Game.particles.draw(ctx, Game.cam.x, Game.cam.y);
   ctx.restore();
 }
@@ -1469,13 +2092,12 @@ function frame(t) {
 function buildPauseControls() {
   const el = $("pauseControls");
   if (isTouch) {
-    el.innerHTML = `<div class="pc-note">Left: <b>GAS + BRAKE</b> · Right: <b>NOS + JUMP</b> · Center: tilt ◀ ▶</div>`;
+    el.innerHTML = `<div class="pc-note">Left: <b>GAS + BRAKE</b> · Right: <b>NOS + JUMP</b> · Center: tilt</div>`;
   } else {
     const rows = [
       ["W · ↑ · Num 8", "Gas"], ["S · ↓ · Num 2", "Brake / reverse"],
-      ["A · ← · Num 4", "Tilt left"], ["D · → · Num 6", "Tilt right"],
-      ["Space · N", "Nitro boost"], ["J · X", "Jump"],
-      ["Esc", "Pause"], ["R", "Restart"],
+      ["A / D · Num 4 / 6", "Tilt mid-air"], ["Space", "Nitro boost"],
+      ["J", "Jump"], ["Esc", "Pause"], ["R", "Restart"],
     ];
     el.innerHTML = rows.map(r => `<div class="pc-row"><kbd>${r[0]}</kbd><span>${r[1]}</span></div>`).join("");
   }
@@ -1511,11 +2133,12 @@ function goHome() {
   Game.paused = false;
   if (Game.net) { Game.net.destroy(); Game.net = null; }
   Game.mode = null;
+  try { sessionStorage.removeItem("rr_room"); } catch (e) {}
   updateHomeStats();
   showScreen("screen-home");
 }
 
-/* ------------------------------ lazy loaders (PeerJS + QR) ------------------------------ */
+/* ------------------------------ lazy loaders ------------------------------ */
 let peerJsLoading = null;
 function ensurePeerJs() {
   if (window.Peer) return Promise.resolve(true);
@@ -1545,7 +2168,7 @@ function ensureQrLib() {
   return qrLibLoading;
 }
 
-/* ------------------------------ QR / invite ------------------------------ */
+/* ------------------------------ QR / invite (never encodes the password) ------------------------------ */
 function buildInviteUrl() {
   let base = location.href.split("?")[0].split("#")[0];
   return base + (base.includes("?") ? "&" : "?") + "room=" + Game.net.roomCode;
@@ -1582,29 +2205,94 @@ async function copyInviteLink() {
   }
 }
 
-/* ------------------------------ multiplayer UI ------------------------------ */
+/* ------------------------------ chat & emotes (client side) ------------------------------ */
+function appendChat(msg) {
+  const log = $("chatLog");
+  if (!log) return;
+  const div = document.createElement("div");
+  const time = new Date(msg.ts || Date.now());
+  const hh = String(time.getHours()).padStart(2, "0"), mm = String(time.getMinutes()).padStart(2, "0");
+  if (msg.sys) {
+    div.className = "c-line c-sys";
+    div.textContent = hh + ":" + mm + " " + msg.text; // system text is host-generated, still rendered as text
+  } else {
+    div.className = "c-line";
+    const b = document.createElement("b");
+    b.textContent = msg.name;                     // user text via textContent — no XSS surface
+    const pre = document.createElement("span");
+    pre.className = "c-time"; pre.textContent = hh + ":" + mm + " ";
+    div.appendChild(pre); div.appendChild(b);
+    div.appendChild(document.createTextNode(": " + String(msg.text).slice(0, CONFIG.CHAT_MAX_LEN)));
+  }
+  log.appendChild(div);
+  while (log.children.length > 60) log.removeChild(log.firstChild); // bounded
+  log.scrollTop = log.scrollHeight;
+}
+function showEmoteBubble(sid, name, code) {
+  Game.bubbles.push({ sid, text: code, t: 2.5 });
+  if (currentScreen() === "screen-lobby") appendChat({ name, text: code, ts: Date.now() });
+}
+function buildEmoteRow() {
+  const row = $("emoteRow");
+  row.innerHTML = "";
+  for (const code of EMOTES) {
+    const b = document.createElement("button");
+    b.className = "emote-btn-s";
+    b.textContent = code;
+    b.onclick = () => { if (Game.net) Game.net.sendEmote(code); };
+    row.appendChild(b);
+  }
+  const panel = $("emotePanel");
+  panel.innerHTML = "";
+  for (const code of EMOTES) {
+    const b = document.createElement("button");
+    b.className = "emote-btn-s";
+    b.style.pointerEvents = "auto";
+    b.textContent = code;
+    b.onclick = () => { if (Game.net) Game.net.sendEmote(code); panel.classList.add("hidden"); };
+    panel.appendChild(b);
+  }
+}
+function sendChatFromInput() {
+  if (!Game.net) return;
+  const el = $("chatInput");
+  const text = el.value.trim();
+  if (!text) return;
+  Game.net.sendChat(text);
+  el.value = "";
+}
+
+/* ------------------------------ multiplayer UI wiring ------------------------------ */
 function setupNetCallbacks(net) {
   net.onPlayersChanged = (list) => { if (currentScreen() === "screen-lobby") renderLobbyPlayers(list); };
   net.onMapChanged = () => { if (currentScreen() === "screen-lobby") renderLobbyMap(); };
+  net.onRoomCfg = (locked, hasPass) => { if (currentScreen() === "screen-lobby") renderLobbyBadges(locked, hasPass); };
   net.onRaceStart = (seed, mapName) => {
     Game.mode = net.isHost ? "host" : "guest";
     Game.mapName = mapName;
     Game.net = net;
+    try { sessionStorage.setItem("rr_room", net.roomCode || ""); } catch (e) {}
     startRace(seed);
   };
-  net.onWorldUpdate = (id, s) => {
-    const g = Game.ghosts.get(id);
+  net.onGo = () => beginGo();
+  net.onWorldUpdate = (sid, s) => {
+    const g = Game.ghosts.get(sid);
     if (g && s) {
       g.tx = s.x; g.ty = s.y; g.ta = s.a;
       g.nitro = !!s.n; g.finished = !!s.f; g.distance = s.d || 0;
     }
   };
+  net.onPositions = (list) => { Game.posList = list; };
+  net.onPickup = (id, by) => onAuthoritativePickup(id, by);
+  net.onChat = (msg) => appendChat(msg);
+  net.onEmote = (e) => showEmoteBubble(e.sid, e.name, e.code);
   net.onLeaderboard = (list) => {
-    for (const e of list) e.me = (e.id === net.myId);
+    for (const e of list) e.me = (e.id === net.mySid);
     const mine = list.find(e => e.me);
     if (mine) {
       if (mine.score > save.best) save.best = mine.score;
       save.coins += (mine.coins || 0);
+      save.firstRun = false;
       persist();
     }
     presentLeaderboard("RACE COMPLETE",
@@ -1615,6 +2303,7 @@ function setupNetCallbacks(net) {
     if (Game.state === "racing" || Game.state === "countdown") hudToast(String(msg).slice(0, 60));
     else if (currentScreen() === "screen-lobby") $("lobbyStatus").textContent = msg;
   };
+  net.onConnState = () => { if (Game.state === "racing" || Game.state === "countdown") updateConnHud(); };
   net.onHostLeft = () => {
     Game.sfx.engineStop(); Game.music.stop();
     Game.state = "menu"; Game.paused = false;
@@ -1624,7 +2313,17 @@ function setupNetCallbacks(net) {
     Game.net = null; Game.mode = null;
     updateHomeStats();
     showScreen("screen-play");
-    $("playStatus").textContent = "The host left the room.";
+    $("playStatus").textContent = "Connection lost — the host is no longer reachable.";
+  };
+  net.onKicked = (reason) => {
+    Game.sfx.engineStop(); Game.music.stop();
+    Game.state = "menu"; Game.paused = false;
+    hideOverlays();
+    $("touchControls").classList.add("hidden");
+    net.destroy(); Game.net = null; Game.mode = null;
+    updateHomeStats();
+    showScreen("screen-home");
+    hudToastSafe("You were removed from the room (" + reason + ").");
   };
   net.onReturnToLobby = () => {
     hideOverlays();
@@ -1633,15 +2332,18 @@ function setupNetCallbacks(net) {
     Game.sfx.engineStop(); Game.music.stop();
     enterLobby();
   };
-  net._onGuestFinish = (id, data) => hostHandleFinish(id, data);
+  net._onGuestFinish = (sid, data) => hostHandleFinish(sid, data);
 }
+function hudToastSafe(msg) { alert(msg); } // rare, explicit user feedback path
+
 function enterLobby() {
   showScreen("screen-lobby");
   const net = Game.net;
   const isHost = net.isHost;
   $("roomCodeBox").style.display = isHost ? "" : "none";
   $("inviteRow").style.display = isHost ? "" : "none";
-  if (isHost) $("roomCode").textContent = net.roomCode || "-----";
+  $("roomTools").classList.toggle("hidden", !isHost);
+  if (isHost) $("roomCode").textContent = net.roomCode || "------";
   $("lobbyStatus").textContent = isHost
     ? "Share the QR / link / code. Start when everyone is in."
     : "Connected! Waiting for the host to start the race.";
@@ -1649,18 +2351,49 @@ function enterLobby() {
   renderLobbyPlayers(net._playerListArr());
   renderLobbyMap();
   renderLobbyVehicle();
+  renderLobbyBadges(net.locked, !!net.password);
+  $("chatLog").innerHTML = "";
   requestWakeLock();
+}
+function renderLobbyBadges(locked, hasPass) {
+  const el = $("lobbyBadges");
+  if (!el) return;
+  el.innerHTML =
+    (hasPass ? '<span class="badge">PASSWORD</span>' : '<span class="badge">PUBLIC</span>') +
+    (locked ? '<span class="badge locked">LOCKED</span>' : '<span class="badge">OPEN</span>');
 }
 function renderLobbyPlayers(list) {
   const ul = $("lobbyPlayers");
-  $("playerCount").textContent = `(${list.length}/${MAX_PLAYERS})`;
+  $("playerCount").textContent = `(${list.filter(p => p.disconnectedAt == null).length}/${CONFIG.MAX_PLAYERS})`;
   ul.innerHTML = "";
+  const iAmHost = Game.net.isHost;
   for (const p of list) {
     const li = document.createElement("li");
-    const you = p.id === Game.net.myId ? ' <span class="you-tag">you</span>' : "";
-    let right = p.isHost ? "★ host" : (VEHICLES[p.vehicle] ? p.vehicle : "");
-    if (!p.isHost && typeof p.ping === "number") right += ` <span class="ping">${p.ping}ms</span>`;
-    li.innerHTML = `<span>${escapeHtml(p.name)}${you}</span><span class="pl-right">${right}</span>`;
+    const you = p.sid === Game.net.mySid ? ' <span class="you-tag">you</span>' : "";
+    const right = document.createElement("span");
+    right.className = "pl-right";
+    let txt = p.isHost ? "★ host" : (VEHICLES[p.vehicle] ? p.vehicle : "");
+    if (p.disconnectedAt != null) txt = '<span class="recon">reconnecting…</span>';
+    else if (!p.isHost && typeof p.ping === "number") txt += ` <span class="ping">${p.ping}ms</span>`;
+    right.innerHTML = txt;
+    const left = document.createElement("span");
+    left.innerHTML = escapeHtml(p.name) + you;
+    li.appendChild(left);
+    if (iAmHost && !p.isHost && p.sid !== Game.net.mySid) {
+      const acts = document.createElement("span");
+      acts.className = "pl-act";
+      const kb = document.createElement("button");
+      kb.className = "mini-btn"; kb.title = "Kick"; kb.textContent = "✕";
+      kb.onclick = () => { if (confirm("Kick " + p.name + "?")) Game.net.kick(p.sid); };
+      const tb = document.createElement("button");
+      tb.className = "mini-btn"; tb.title = "Make host"; tb.textContent = "★";
+      tb.onclick = () => {
+        if (confirm("Transfer host to " + p.name + " and leave?")) Game.net.transferHost(p.sid);
+      };
+      acts.appendChild(tb); acts.appendChild(kb);
+      li.appendChild(acts);
+    }
+    li.appendChild(right);
     ul.appendChild(li);
   }
 }
@@ -1683,7 +2416,7 @@ function renderLobbyMap() {
 function renderLobbyVehicle() {
   const el = $("lobbyVehicle");
   el.innerHTML = "";
-  const me = Game.net.players.get(Game.net.myId);
+  const me = Game.net.players.get(Game.net.mySid);
   const cur = (me && me.vehicle) || save.vehicle;
   for (const v of Object.keys(VEHICLES)) {
     const d = document.createElement("div");
@@ -1752,14 +2485,55 @@ function updateHomeStats() {
 function updateSettingsUI() {
   $("btnMusicToggle").textContent = save.music ? "ON" : "OFF";
   $("btnSoundToggle").textContent = save.sound ? "ON" : "OFF";
+  $("btnQuality").textContent = save.quality.toUpperCase();
+  $("btnVibToggle").textContent = save.vibration ? "ON" : "OFF";
+  $("btnMotionToggle").textContent = save.reducedMotion ? "ON" : "OFF";
   $("btnPedalsToggle").textContent = save.pedals ? "ON" : "OFF";
   $("settingsBest").textContent = save.best.toLocaleString();
   $("settingsCoins").textContent = save.coins.toLocaleString();
+  applyPedalStyle();
+}
+function applyPedalStyle() {
+  const s = (parseInt($("pedalSize").value, 10) || 100) / 100;
+  const o = (parseInt($("pedalOpacity").value, 10) || 90) / 100;
+  document.documentElement.style.setProperty("--pedal-scale", s);
+  document.documentElement.style.setProperty("--pedal-opacity", o);
 }
 
-/* ------------------------------ input (WASD + arrows + NUMPAD 8/4/6/2) ------------------------------
-   Numpad note: with NumLock ON, e.key is "8"/"4"/"6"/"2"; with NumLock OFF the same
-   physical keys emit ArrowUp/Left/Right/Down — both paths are handled below.      */
+/* ------------------------------ feedback (honest: mailto, no fake server) ------------------------------ */
+function feedbackValidate() {
+  const msg = $("fbMsg").value.trim();
+  if (msg.length < 10) return { ok: false, err: "Message must be at least 10 characters." };
+  if (msg.length > 1000) return { ok: false, err: "Message too long (max 1000)." };
+  return { ok: true, msg };
+}
+function feedbackBody() {
+  return `Category: ${$("fbCategory").value}\nRating: ${$("fbRating").value}/5\n` +
+    `Message:\n${feedbackValidate().msg}\n\nContact: ${$("fbContact").value.trim() || "—"}\n` +
+    `App: ROAD RUSH web · ${new Date().toISOString()}`;
+}
+function submitFeedback() {
+  const v = feedbackValidate();
+  if (!v.ok) { $("fbStatus").textContent = v.err; return; }
+  Game.sfx.play("click");
+  try {
+    const log = JSON.parse(localStorage.getItem("rr_feedback") || "[]");
+    log.push({ cat: $("fbCategory").value, rating: $("fbRating").value, msg: v.msg, ts: Date.now() });
+    while (log.length > 20) log.shift();
+    localStorage.setItem("rr_feedback", JSON.stringify(log));
+  } catch (e) {}
+  if (FEEDBACK_EMAIL === "you@example.com") {
+    $("fbStatus").textContent = "Saved locally. Set FEEDBACK_EMAIL in game.js to enable email.";
+    return;
+  }
+  const url = "mailto:" + FEEDBACK_EMAIL +
+    "?subject=" + encodeURIComponent("[ROAD RUSH] " + $("fbCategory").value) +
+    "&body=" + encodeURIComponent(feedbackBody());
+  window.location.href = url;
+  $("fbStatus").textContent = "Opening your email app…";
+}
+
+/* ------------------------------ input (WASD + arrows + numpad 8/4/6/2) ------------------------------ */
 window.addEventListener("keydown", (e) => {
   if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
   const k = e.key;
@@ -1782,7 +2556,6 @@ window.addEventListener("keyup", (e) => {
 });
 window.addEventListener("blur", () => { input.accel = input.brake = input.left = input.right = false; });
 
-/* pedals — pointer capture so a sliding finger can't stick a button */
 function bindPedal(el, down, up) {
   el.addEventListener("pointerdown", (e) => {
     e.preventDefault();
@@ -1797,6 +2570,7 @@ function bindPedal(el, down, up) {
   };
   el.addEventListener("pointerup", release);
   el.addEventListener("pointercancel", release);
+  el.addEventListener("pointerleave", release);
   el.addEventListener("lostpointercapture", release);
   el.addEventListener("contextmenu", (e) => e.preventDefault());
 }
@@ -1807,21 +2581,26 @@ function init() {
   ctx = $("raceCanvas").getContext("2d");
   resizeCanvas();
   Game.sfx.enabled = save.sound;
-  Game.music.probeExternal(); // checks for an optional race-music.mp3
+  Game.music.probeExternal();
   buildVehicleScreen();
   buildMapScreen();
+  buildEmoteRow();
   updateHomeStats();
   updateSettingsUI();
   $("inpName").value = save.name;
+  $("pedalSize").value = save.pedalSizeVal || 100;
+  $("pedalOpacity").value = save.pedalOpVal || 90;
 
-  // invite link auto-join (?room=CODE)
+  // ?debug diagnostics + ?room=CODE invite links
   try {
     const qp = new URLSearchParams(location.search);
-    pendingRoom = (qp.get("room") || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 5) || null;
+    DEBUG_MODE = qp.has("debug");
+    pendingRoom = (qp.get("room") || "").toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 6) || null;
   } catch (e) { pendingRoom = null; }
+  $("debugPanel").classList.toggle("hidden", !DEBUG_MODE);
   if (pendingRoom) {
     showScreen("screen-play");
-    $("playStatus").textContent = `Invited to room ${pendingRoom} — type your name, then tap JOIN RACE.`;
+    $("playStatus").textContent = `Invited to room ${pendingRoom} — enter your name, then JOIN ROOM.`;
   }
 
   bindPedal($("btnGas"), () => input.accel = true, () => input.accel = false);
@@ -1832,44 +2611,63 @@ function init() {
   bindPedal($("btnNitro"), () => nitroQueued = true, null);
 
   $("btnPlay").onclick = () => { Game.sfx.play("click"); $("playStatus").textContent = ""; showScreen("screen-play"); };
-  $("btnMulti").onclick = () => { Game.sfx.play("click"); $("playStatus").textContent = ""; showScreen("screen-play"); };
   $("btnVehicle").onclick = () => { Game.sfx.play("click"); buildVehicleScreen(); showScreen("screen-vehicle"); };
   $("btnVehicleBack").onclick = () => { Game.sfx.play("click"); updateHomeStats(); showScreen("screen-home"); };
   $("btnMap").onclick = () => { Game.sfx.play("click"); buildMapScreen(); showScreen("screen-map"); };
   $("btnMapBack").onclick = () => { Game.sfx.play("click"); updateHomeStats(); showScreen("screen-home"); };
+  $("btnHowTo").onclick = () => { Game.sfx.play("click"); showScreen("screen-howto"); };
+  $("btnHowToBack").onclick = () => { Game.sfx.play("click"); showScreen("screen-home"); };
+  $("btnFeedback").onclick = () => { Game.sfx.play("click"); $("fbStatus").textContent = ""; showScreen("screen-feedback"); };
+  $("btnFbBack").onclick = () => { Game.sfx.play("click"); showScreen("screen-home"); };
+  $("btnFbSubmit").onclick = submitFeedback;
+  $("btnFbCopy").onclick = async () => {
+    const v = feedbackValidate();
+    if (!v.ok) { $("fbStatus").textContent = v.err; return; }
+    try { await navigator.clipboard.writeText(feedbackBody()); $("fbStatus").textContent = "Copied to clipboard."; }
+    catch (e) { $("fbStatus").textContent = "Copy failed — select and copy manually."; }
+  };
   $("btnPlayBack").onclick = () => { Game.sfx.play("click"); updateHomeStats(); showScreen("screen-home"); };
+
   $("btnJoinMenu").onclick = () => {
     Game.sfx.play("click");
-    save.name = ($("inpName").value.trim() || "Player").slice(0, 12); persist();
+    const v = validateName($("inpName").value);
+    if (!v.ok) { $("playStatus").textContent = v.reason; return; }
+    save.name = v.name; persist();
+    $("inpName").value = v.name;
     $("joinStatus").textContent = ""; $("joinError").textContent = ""; $("inpRoomCode").value = "";
     showScreen("screen-join");
     if (pendingRoom) {
       $("inpRoomCode").value = pendingRoom;
       const code = pendingRoom;
       pendingRoom = null;
-      setTimeout(() => { if ($("inpRoomCode").value === code) $("btnJoinConnect").click(); }, 500);
+      setTimeout(() => { if ($("inpRoomCode").value === code) $("btnJoinConnect").click(); }, 400);
     }
   };
   $("btnJoinBack").onclick = () => { Game.sfx.play("click"); showScreen("screen-play"); };
   $("btnSettings").onclick = () => { Game.sfx.play("click"); updateSettingsUI(); showScreen("screen-settings"); };
   $("btnSettingsBack").onclick = () => { Game.sfx.play("click"); updateHomeStats(); showScreen("screen-home"); };
   $("btnMusicToggle").onclick = () => {
-    save.music = !save.music;
-    Game.music.setEnabled(save.music);
-    persist(); updateSettingsUI();
-    Game.sfx.play("click");
+    save.music = !save.music; Game.music.setEnabled(save.music);
+    persist(); updateSettingsUI(); Game.sfx.play("click");
   };
   $("btnSoundToggle").onclick = () => {
-    save.sound = !save.sound;
-    Game.sfx.enabled = save.sound;
-    persist(); updateSettingsUI();
-    Game.sfx.play("click");
+    save.sound = !save.sound; Game.sfx.enabled = save.sound;
+    persist(); updateSettingsUI(); Game.sfx.play("click");
   };
-  $("btnPedalsToggle").onclick = () => {
-    save.pedals = !save.pedals;
-    persist(); updateSettingsUI();
-    Game.sfx.play("click");
+  $("btnQuality").onclick = () => {
+    const order = ["auto", "low", "medium", "high"];
+    save.quality = order[(order.indexOf(save.quality) + 1) % order.length];
+    persist(); updateSettingsUI(); Game.sfx.play("click");
   };
+  $("btnVibToggle").onclick = () => { save.vibration = !save.vibration; persist(); updateSettingsUI(); Game.sfx.play("click"); };
+  $("btnMotionToggle").onclick = () => {
+    save.reducedMotion = !save.reducedMotion;
+    document.body.classList.toggle("no-motion", save.reducedMotion);
+    persist(); updateSettingsUI(); Game.sfx.play("click");
+  };
+  $("btnPedalsToggle").onclick = () => { save.pedals = !save.pedals; persist(); updateSettingsUI(); Game.sfx.play("click"); };
+  $("pedalSize").oninput = () => { save.pedalSizeVal = parseInt($("pedalSize").value, 10); persist(); applyPedalStyle(); };
+  $("pedalOpacity").oninput = () => { save.pedalOpVal = parseInt($("pedalOpacity").value, 10); persist(); applyPedalStyle(); };
   $("btnResetSave").onclick = () => {
     save.best = 0; save.coins = 0;
     persist(); updateSettingsUI(); updateHomeStats();
@@ -1878,7 +2676,9 @@ function init() {
 
   $("btnSingle").onclick = () => {
     Game.sfx.play("click");
-    save.name = ($("inpName").value.trim() || "Player").slice(0, 12); persist();
+    const v = validateName($("inpName").value);
+    if (!v.ok) { $("playStatus").textContent = v.reason; return; }
+    save.name = v.name; $("inpName").value = v.name; persist();
     Game.mode = "single";
     Game.net = null;
     Game.mapName = save.map;
@@ -1887,32 +2687,39 @@ function init() {
 
   $("btnCreate").onclick = async () => {
     Game.sfx.play("click");
-    save.name = ($("inpName").value.trim() || "Player").slice(0, 12); persist();
+    const v = validateName($("inpName").value);
+    if (!v.ok) { $("playStatus").textContent = v.reason; return; }
+    save.name = v.name; $("inpName").value = v.name; persist();
     $("playStatus").textContent = "Creating room…";
     await ensurePeerJs();
     if (!window.Peer) {
-      $("playStatus").textContent = "Multiplayer unavailable — the connection library could not load. Single player still works.";
+      $("playStatus").textContent = "Multiplayer unavailable — the connection library could not load. Solo still works.";
       return;
     }
+    const pass = prompt("Optional room password (leave empty for a public room):", "") || "";
     const net = new NetManager();
     setupNetCallbacks(net);
     try {
-      await net.createRoom(save.name);
+      await net.createRoom(save.name, pass);
       Game.net = net;
       Game.mode = "host";
       $("playStatus").textContent = "";
       enterLobby();
     } catch (e) {
       net.destroy();
-      $("playStatus").textContent = "Could not create a room — check your internet and try again.";
+      $("playStatus").textContent = e.message && e.message.startsWith("badname:")
+        ? e.message.slice(8)
+        : "Could not create a room — check your internet and try again.";
     }
   };
 
   $("btnJoinConnect").onclick = async () => {
     const code = $("inpRoomCode").value.trim().toUpperCase().replace(/[^A-Z0-9]/g, "");
-    if (code.length !== 5) { $("joinError").textContent = "Enter the 5-character room code."; return; }
+    if (code.length !== CONFIG.CODE_LEN) { $("joinError").textContent = "Enter the " + CONFIG.CODE_LEN + "-character room code."; return; }
     Game.sfx.play("click");
-    save.name = ($("inpName").value.trim() || save.name || "Player").slice(0, 12); persist();
+    const v = validateName($("inpName").value);
+    if (!v.ok) { $("joinError").textContent = v.reason; return; }
+    save.name = v.name; $("inpName").value = v.name; persist();
     $("joinStatus").textContent = "Connecting…";
     $("joinError").textContent = "";
     await ensurePeerJs();
@@ -1924,7 +2731,7 @@ function init() {
     const net = new NetManager();
     setupNetCallbacks(net);
     try {
-      await net.joinRoom(code, save.name);
+      await net.joinRoom(code, save.name, $("inpRoomPass").value);
       Game.net = net;
       Game.mode = "guest";
       $("joinStatus").textContent = "";
@@ -1933,24 +2740,43 @@ function init() {
       net.destroy();
       const msg =
         e.message === "notfound" ? "Room not found — check the code, or the host may have left." :
-        e.message === "full" ? "That room is full (20 players max)." :
-        e.message === "timeout" ? "Connection timed out — check both devices' internet and retry." :
-        e.message === "network" ? "Network blocked the connection — try again or a different Wi-Fi." :
+        e.message === "full" ? "That room is full (" + CONFIG.MAX_PLAYERS + "/" + CONFIG.MAX_PLAYERS + ")." :
+        e.message === "password" ? "Wrong password." :
+        e.message === "locked" ? "Room is locked." :
+        e.message === "name" ? "Username already in use." :
+        e.message === "badname" ? "Invalid username." :
+        e.message === "dupsession" ? "Already connected in another tab." :
+        e.message === "toomany" ? "Too many attempts — wait a moment." :
+        e.message === "timeout" ? "Connection timed out — check both devices' internet." :
+        e.message === "network" ? "Network blocked the connection — try again or another network." :
         "Could not connect — check your internet.";
       $("joinStatus").textContent = "";
       $("joinError").textContent = msg;
     }
   };
   $("inpRoomCode").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btnJoinConnect").click(); });
-  $("inpName").addEventListener("keydown", (e) => { if (e.key === "Enter") e.target.blur(); });
+  $("inpName").addEventListener("blur", () => {
+    const v = validateName($("inpName").value);
+    $("nameHint").textContent = v.ok ? "✓ " + v.name.length + " characters" : v.reason;
+  });
+  $("chatInput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendChatFromInput(); });
+  $("btnChatSend").onclick = sendChatFromInput;
+  $("btnChatToggle").onclick = () => { $("chatPanel").classList.toggle("collapsed"); };
 
   $("btnStartRace").onclick = () => { Game.sfx.play("click"); Game.net.startRace(); };
   $("btnLeaveLobby").onclick = () => { Game.sfx.play("click"); releaseWakeLock(); goHome(); };
+  $("btnSetPass").onclick = () => {
+    const pw = prompt("Room password (leave empty to remove):", "");
+    if (pw === null) return;
+    Game.net.setPassword(pw);
+  };
+  $("btnLockToggle").onclick = () => { Game.net.setLocked(!Game.net.locked); };
   $("btnCopyLink").onclick = () => copyInviteLink();
   $("btnShowQr").onclick = () => showQrOverlay();
   $("btnQrClose").onclick = () => { Game.sfx.play("click"); $("overlay-qr").classList.add("hidden"); };
 
   $("btnPause").onclick = () => Game.togglePause();
+  $("btnEmote").onclick = () => { $("emotePanel").classList.toggle("hidden"); };
   $("btnResume").onclick = () => { Game.sfx.play("click"); Game.togglePause(); };
   $("btnRestart").onclick = () => { Game.sfx.play("click"); Game.handleRestartKey(); };
   $("btnQuit").onclick = () => { Game.sfx.play("click"); goHome(); };
@@ -1970,4 +2796,5 @@ function init() {
   requestAnimationFrame(frame);
 }
 
-init();
+/* init() only runs in the real app DOM — tests.html loads this file without it. */
+if (document.getElementById("raceCanvas")) init();
