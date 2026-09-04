@@ -18,6 +18,16 @@ const MAX_PLAYERS = 4;           // host + 3 guests (matches single player: you 
 const NET_SEND_HZ = 15;          // own-state broadcast rate
 const RACE_TIMEOUT = 240;        // hard race time limit (s)
 const START_X = 120;
+const PEER_OPTIONS = {
+  debug: 0,
+  config: {
+    iceServers: [
+      { urls: "stun:stun.l.google.com:19302" },
+      { urls: "stun:stun1.l.google.com:19302" },
+      { urls: "stun:stun2.l.google.com:19302" },
+    ],
+  },
+};
 
 function clamp(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
 function lerp(a, b, t) { return a + (b - a) * t; }
@@ -277,6 +287,7 @@ class RacePlayer {
 
     this.fuel = this.fuelCap;
     this.nitroCharges = 0; this.maxNitro = 3; this.nitroTimer = 0;
+    this.jumpCd = 0;
     this.coins = 0; this.distance = 0;
     this.finished = false; this.finishTime = null;
     this.stunned = 0; this.shake = 0; this._dustCd = 0;
@@ -300,13 +311,14 @@ class RacePlayer {
 
     if (this.stunned > 0) {
       this.stunned -= dt;
-      input = { accel: false, brake: false, left: false, right: false, nitro: false };
+      input = { accel: false, brake: false, left: false, right: false, nitro: false, jump: false };
     }
-    let { accel, brake, left, right, nitro } = input;
-    if (!raceStarted) { accel = brake = left = right = nitro = false; }
+    let { accel, brake, left, right, nitro, jump } = input;
+    if (!raceStarted) { accel = brake = left = right = nitro = jump = false; }
 
     if (nitro && raceStarted) this.useNitro(particles, sfx);
     if (this.nitroTimer > 0) this.nitroTimer -= dt;
+    if (this.jumpCd > 0) this.jumpCd -= dt;
     const nitroBoost = this.nitroTimer > 0 ? 1.55 : 1.0;
 
     const outOfFuel = this.fuel <= 0;
@@ -324,6 +336,14 @@ class RacePlayer {
       if (brake) {
         if (this.vx > 5) this.vx -= this.brakePower * dt;
         else this.vx -= this.accelPower * 0.5 * dt; // reverse
+      }
+      if (jump && this.jumpCd <= 0) {
+        this.onGround = false;
+        this.vy = -430;
+        this.vx += 40;
+        this.jumpCd = 0.65;
+        particles.emit(this.x, this.y + this.h / 2, 4, t.def.dust,
+          { spread: 70, speed: 100, life: 0.25, size: 2, gravity: 520 });
       }
       // dt-corrected traction: lower map traction ⇒ less speed bleed ⇒ sliding
       const frameF = GROUND_FRICTION + (1 - GROUND_FRICTION) * (1 - t.def.traction);
@@ -461,7 +481,7 @@ class NetManager {
   _createWithRetry(attempt, resolve, reject) {
     const code = this._makeRoomCode();
     let settled = false;
-    try { this.peer = new Peer("roadrush-" + code, { debug: 0 }); }
+    try { this.peer = new Peer("roadrush-" + code, PEER_OPTIONS); }
     catch (e) { reject(e); return; }
     this.peer.on("error", (err) => {
       if (settled) return;
@@ -654,13 +674,16 @@ class NetManager {
         ok: () => { if (!settle.done) { settle.done = true; clearTimeout(settle.to); resolve(code.trim().toUpperCase()); } },
         err: (m) => { if (!settle.done) { settle.done = true; clearTimeout(settle.to); reject(new Error(m)); } },
       };
-      settle.to = setTimeout(() => settle.err("timeout"), 12000);
+      settle.to = setTimeout(() => settle.err("timeout"), 20000);
       this._joinSettle = settle;
-      try { this.peer = new Peer(undefined, { debug: 0 }); }
+      try { this.peer = new Peer(undefined, PEER_OPTIONS); }
       catch (e) { settle.err("network"); return; }
       this.peer.on("error", (err) => {
         if (err && err.type === "peer-unavailable") settle.err("notfound");
         else settle.err("network");
+      });
+      this.peer.on("disconnected", () => {
+        if (!settle.done) settle.err("network");
       });
       this.peer.on("open", (id) => {
         this.myId = id;
@@ -668,6 +691,9 @@ class NetManager {
         this.hostConn = conn;
         conn.on("open", () => conn.send({ t: "hello", name: this.myName, vehicle: save.vehicle }));
         conn.on("data", (data) => this._handleHostMessage(data));
+        conn.on("error", () => {
+          if (!settle.done) settle.err("network");
+        });
         conn.on("close", () => {
           if (!settle.done) settle.err("closed");
           else if (this.onHostLeft) this.onHostLeft();
@@ -969,6 +995,7 @@ const isTouch = (window.matchMedia && matchMedia("(pointer: coarse)").matches) |
 
 const input = { accel: false, brake: false, left: false, right: false };
 let nitroQueued = false;
+let jumpQueued = false;
 let toastT = 0, toastMsg = "";
 
 const Game = {
@@ -1067,7 +1094,7 @@ function startRace(seed) {
 
   showScreen("screen-race");
   hideOverlays();
-  $("touchControls").classList.toggle("hidden", !isTouch);
+  $("touchControls").classList.remove("hidden");
   $("hudWarning").textContent = "";
   Game.sfx.engineStart();
 }
@@ -1413,8 +1440,10 @@ function update(dt) {
     const inp = {
       accel: input.accel, brake: input.brake, left: input.left, right: input.right,
       nitro: nitroQueued,
+      jump: jumpQueued,
     };
     nitroQueued = false;
+    jumpQueued = false;
     if (Game.local.finished) { inp.accel = false; inp.brake = true; inp.left = inp.right = false; }
     Game.local.update(dt, inp, Game.particles, Game.sfx, raceStarted);
     if (Game.local.shake) { Game.cam.shake = Math.max(Game.cam.shake, Game.local.shake); Game.local.shake = 0; }
@@ -1550,6 +1579,27 @@ function ensurePeerJs() {
 }
 
 /* ------------------------------ multiplayer UI ------------------------------ */
+function renderRoomQr() {
+  const box = $("roomCodeBox");
+  const img = $("roomQr");
+  const status = $("roomQrStatus");
+  if (!Game.net || !Game.net.isHost || !Game.net.roomCode) {
+    img.classList.add("hidden");
+    status.textContent = "";
+    return;
+  }
+  const code = Game.net.roomCode;
+  const me = Game.net.players.get(Game.net.myId);
+  const hostName = me && me.name ? me.name : "Host";
+  const invite = `ROAD RUSH room ${code} host ${hostName}`;
+  const src = "https://api.qrserver.com/v1/create-qr-code/?size=180x180&data=" + encodeURIComponent(invite);
+  img.src = src;
+  img.alt = `Room QR for ${code}`;
+  img.classList.remove("hidden");
+  status.textContent = "Scan to copy room code";
+  box.style.display = "";
+}
+
 function setupNetCallbacks(net) {
   net.onPlayersChanged = (list) => { if (currentScreen() === "screen-lobby") renderLobbyPlayers(list); };
   net.onMapChanged = () => { if (currentScreen() === "screen-lobby") renderLobbyMap(); };
@@ -1611,6 +1661,7 @@ function enterLobby() {
   const isHost = net.isHost;
   $("roomCodeBox").style.display = isHost ? "" : "none";
   if (isHost) $("roomCode").textContent = net.roomCode || "-----";
+  renderRoomQr();
   $("lobbyStatus").textContent = isHost
     ? "Share this code with friends. Start when everyone is in."
     : "Connected! Waiting for the host to start the race.";
@@ -1623,6 +1674,7 @@ function enterLobby() {
 function renderLobbyPlayers(list) {
   const ul = $("lobbyPlayers");
   ul.innerHTML = "";
+  $("lobbyPlayerCount").textContent = `${list.length}/${MAX_PLAYERS}`;
   for (const p of list) {
     const li = document.createElement("li");
     const you = p.id === Game.net.myId ? ' <span class="you-tag">you</span>' : "";
@@ -1738,12 +1790,13 @@ function updateSettingsUI() {
 window.addEventListener("keydown", (e) => {
   if (e.target && (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA")) return;
   const k = e.key;
-  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " "].includes(k)) e.preventDefault();
+  if (["ArrowUp", "ArrowDown", "ArrowLeft", "ArrowRight", " ", "Shift"].includes(k)) e.preventDefault();
   if (k === "w" || k === "W" || k === "ArrowUp") input.accel = true;
   else if (k === "s" || k === "S" || k === "ArrowDown") input.brake = true;
   else if (k === "a" || k === "A" || k === "ArrowLeft") input.left = true;
   else if (k === "d" || k === "D" || k === "ArrowRight") input.right = true;
   else if (k === " " && !e.repeat) nitroQueued = true; // edge-triggered
+  else if ((k === "Shift" || k === "j" || k === "J") && !e.repeat) jumpQueued = true; // edge-triggered
   else if (k === "Escape") Game.togglePause();
   else if ((k === "r" || k === "R") && Game.state !== "menu") Game.handleRestartKey();
 });
@@ -1754,7 +1807,11 @@ window.addEventListener("keyup", (e) => {
   else if (k === "a" || k === "A" || k === "ArrowLeft") input.left = false;
   else if (k === "d" || k === "D" || k === "ArrowRight") input.right = false;
 });
-window.addEventListener("blur", () => { input.accel = input.brake = input.left = input.right = false; });
+window.addEventListener("blur", () => {
+  input.accel = input.brake = input.left = input.right = false;
+  nitroQueued = false;
+  jumpQueued = false;
+});
 
 /* Touch pedals — pointer capture so a finger sliding off a button can't leave it stuck */
 function bindPedal(el, down, up) {
@@ -1793,6 +1850,7 @@ function init() {
   bindPedal($("btnBrake"), () => input.brake = true, () => input.brake = false);
   bindPedal($("btnTiltL"), () => input.left = true, () => input.left = false);
   bindPedal($("btnTiltR"), () => input.right = true, () => input.right = false);
+  bindPedal($("btnJump"), () => jumpQueued = true, null);
   bindPedal($("btnNitro"), () => nitroQueued = true, null);
 
   // menu buttons
@@ -1854,7 +1912,7 @@ function init() {
       enterLobby();
     } catch (e) {
       net.destroy();
-      $("playStatus").textContent = "Could not create a room — check your internet connection.";
+      $("playStatus").textContent = "Could not create a room — check internet and retry.";
     }
   };
 
@@ -1885,8 +1943,9 @@ function init() {
       const msg =
         e.message === "notfound" ? "Room not found — check the code." :
         e.message === "full" ? "That room is full (4 players max)." :
-        e.message === "timeout" ? "Connection timed out — check your internet." :
-        "Could not connect — check your internet.";
+        e.message === "timeout" ? "Connection timed out — ask host to keep the room open and try again." :
+        e.message === "closed" ? "Connection closed before joining — please retry." :
+        "Could not connect — check internet and try a different network if possible.";
       $("joinStatus").textContent = "";
       $("joinError").textContent = msg;
     }
