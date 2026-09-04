@@ -1,0 +1,200 @@
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; user-select: none; }
+html, body {
+  margin: 0; padding: 0; width: 100%; height: 100%;
+  background: #0a0a0e; color: #f2f2f2;
+  font-family: 'Segoe UI', system-ui, -apple-system, Arial, sans-serif;
+  overflow: hidden; overscroll-behavior: none;
+}
+#screen-race.no-pad { padding: 0; }
+
+.screen {
+  position: fixed; inset: 0;
+  display: flex; flex-direction: column; align-items: center;
+  padding: 16px 16px; overflow-y: auto;
+  background: radial-gradient(ellipse at top, #1a2138 0%, #0a0a0e 70%);
+}
+.hidden { display: none !important; }
+
+.title-wrap { margin-top: 6vh; text-align: center; }
+.game-title {
+  font-size: clamp(38px, 9vw, 64px); font-weight: 900; letter-spacing: 2px;
+  color: #f3d34a; text-shadow: 0 4px 0 #7a5c00, 0 6px 12px rgba(0,0,0,.5);
+  margin: 0;
+}
+.subtitle { color: #9aa3b8; font-size: 15px; margin-top: 6px; }
+.screen-title {
+  font-size: clamp(20px, 5vw, 30px); color: #f3d34a; margin: 4px 0 14px;
+  letter-spacing: 1px; text-align: center;
+}
+
+.menu-col {
+  display: flex; flex-direction: column; gap: 10px; width: min(360px, 90vw);
+  margin-top: 16px; align-items: stretch;
+}
+.btn {
+  padding: 13px 20px; font-size: 17px; font-weight: 600; color: #fff;
+  background: #2b3550; border: 2px solid #3f4d70; border-radius: 12px;
+  cursor: pointer; transition: transform .08s, background .15s;
+}
+.btn:active { transform: scale(0.96); }
+.btn-race {
+  background: linear-gradient(180deg,#ff6b4a,#d6371a); border-color: #ff9b4a;
+  font-size: 22px; padding: 20px; box-shadow: 0 6px 18px rgba(214,55,26,.4);
+}
+.btn-primary { background: linear-gradient(180deg,#4f7fe0,#3560c2); border-color: #6f9ff0; }
+.btn-back { background: #1b1f2b; border-color: #333; color: #aab; }
+.btn-small { padding: 8px 16px; font-size: 14px; align-self: center; margin-top: 8px; }
+
+.vehicle-grid {
+  display: flex; flex-direction: column; gap: 16px; width: min(420px, 92vw); margin-top: 10px;
+}
+.vehicle-card {
+  display: flex; align-items: center; gap: 16px; padding: 14px 16px;
+  background: #171c2c; border: 2px solid #2a3350; border-radius: 14px; cursor: pointer;
+}
+.vehicle-card.selected { border-color: #f3d34a; background: #23273a; }
+.vehicle-card .vshape { width: 64px; height: 40px; flex-shrink: 0; }
+.vehicle-card .vinfo { flex: 1; }
+.vehicle-card .vname { font-size: 18px; font-weight: 700; }
+.vehicle-card .vdesc { font-size: 13px; color: #9aa3b8; margin-top: 2px; }
+.vehicle-card .vstats { font-size: 11px; color: #6b7690; margin-top: 4px; }
+
+.text-input {
+  padding: 14px; font-size: 20px; text-align: center; letter-spacing: 3px;
+  border-radius: 10px; border: 2px solid #3f4d70; background: #10131c; color: #fff;
+  text-transform: uppercase;
+}
+.text-input.small { text-align: left; letter-spacing: normal; font-size: 16px; padding: 8px 10px; width: 140px; }
+.setting-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 4px; }
+.error-text { color: #ff6b6b; font-size: 14px; text-align: center; min-height: 18px; }
+.status-text { color: #9aa3b8; font-size: 14px; text-align: center; min-height: 18px; }
+
+.room-code-box { text-align: center; margin-bottom: 6px; }
+.room-code-label { font-size: 11px; color: #9aa3b8; letter-spacing: 2px; }
+.room-code {
+  font-size: clamp(24px, 6vw, 34px); font-weight: 900; letter-spacing: 6px; color: #6ee7a8;
+  background: #10131c; border: 2px dashed #2a3350; border-radius: 10px; padding: 5px 16px; margin-top: 3px;
+}
+
+.lobby-cols {
+  display: flex; gap: 14px; width: min(640px, 94vw); flex-wrap: wrap; justify-content: center; margin-top: 10px;
+}
+.lobby-panel {
+  flex: 1; min-width: 240px; max-width: 300px; background: #12162280; border: 1px solid #2a3350;
+  border-radius: 12px; padding: 10px 12px; max-height: 150px; overflow-y: auto;
+}
+.panel-label { font-size: 12px; color: #9aa3b8; letter-spacing: 1px; margin-bottom: 6px; text-transform: uppercase; }
+.player-list { list-style: none; margin: 0; padding: 0; }
+.player-list li {
+  padding: 6px 9px; border-radius: 7px; background: #1b2033; margin-bottom: 5px;
+  display: flex; justify-content: space-between; font-size: 14px;
+}
+.player-list li .you-tag { color: #f3d34a; font-size: 11px; }
+.map-select { display: flex; flex-direction: column; gap: 5px; }
+.map-opt {
+  padding: 7px 9px; border-radius: 7px; background: #1b2033; cursor: pointer; font-size: 13px;
+  border: 2px solid transparent;
+}
+.map-opt.selected { border-color: #f3d34a; background: #262b40; }
+.map-select-readonly { font-size: 14px; color: #ddd; }
+
+.leaderboard { width: min(420px, 92vw); margin: 0; padding: 0; list-style: none; }
+.leaderboard li {
+  display: flex; justify-content: space-between; align-items: center;
+  background: #171c2c; border-radius: 10px; padding: 12px 16px; margin-bottom: 8px; font-size: 16px;
+}
+.leaderboard li.place-1 { border: 2px solid #f3d34a; }
+.leaderboard li .lb-place { font-weight: 800; width: 32px; }
+.leaderboard li .lb-name { flex: 1; padding-left: 6px; }
+.leaderboard li .lb-detail { font-size: 12px; color: #9aa3b8; }
+
+/* ---------------- RACE SCREEN ---------------- */
+#screen-race { padding: 0; overflow: hidden; background: #000; }
+#raceCanvas { display: block; width: 100%; height: 100%; touch-action: none; }
+
+.hud {
+  position: absolute; top: 0; left: 0; right: 0; padding: 8px 14px;
+  display: flex; flex-direction: column; gap: 4px; pointer-events: none;
+  font-size: 14px; text-shadow: 0 2px 3px rgba(0,0,0,.8);
+}
+.hud-top { display: flex; align-items: center; gap: 10px; }
+.hud-right { margin-left: auto; }
+.hud-fuel-label { font-size: 10px; color: #ccc; letter-spacing: 1px; }
+.hud-fuel-wrap { flex: 1; max-width: 200px; height: 12px; background: #0006; border-radius: 6px; overflow: hidden; }
+.hud-fuel-bar { height: 100%; width: 100%; background: linear-gradient(90deg,#6ee7a8,#39c96b); transition: width .2s; }
+.hud-bottom-left { display: flex; align-items: center; gap: 10px; }
+.nitro-wrap { display: flex; flex-direction: column; gap: 2px; align-items: center; }
+.nitro-pips { display: flex; gap: 4px; }
+.nitro-pips .pip { width: 12px; height: 12px; border-radius: 50%; background: #2a3350; display: inline-block; }
+.nitro-pips .pip.on { background: #4fd6ff; box-shadow: 0 0 6px #4fd6ff; }
+
+.countdown-overlay {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  pointer-events: none;
+}
+.countdown-num {
+  font-size: 120px; font-weight: 900; color: #f3d34a;
+  text-shadow: 0 6px 0 #7a5c00, 0 10px 24px rgba(0,0,0,.6);
+  animation: pop .5s ease;
+}
+@keyframes pop { from { transform: scale(0.4); opacity: 0; } to { transform: scale(1); opacity: 1; } }
+
+.overlay {
+  position: fixed; inset: 0; background: #000c; z-index: 50;
+  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 10px;
+}
+.big-label { font-size: 34px; font-weight: 800; color: #f3d34a; }
+.sub-label { font-size: 15px; color: #ccc; }
+.rotate-icon { font-size: 60px; animation: spin 1.6s linear infinite; }
+@keyframes spin { from { transform: rotate(0); } to { transform: rotate(360deg); } }
+
+.icon-btn {
+  position: absolute; width: 42px; height: 42px; border-radius: 50%;
+  background: #000a; border: 2px solid #fff4; color: #fff; font-size: 16px; font-weight: 700;
+}
+.pause-btn { top: 12px; right: 12px; }
+
+.touch-controls {
+  position: absolute; bottom: 18px; left: 0; right: 0;
+  display: flex; justify-content: space-between; padding: 0 18px; pointer-events: none;
+}
+.pedal {
+  pointer-events: auto; width: 84px; height: 84px; border-radius: 50%;
+  font-weight: 800; font-size: 13px; letter-spacing: 1px; color: #fff; border: 3px solid #fff3;
+  opacity: 0.88;
+}
+.pedal-gas { background: radial-gradient(circle at 35% 30%, #6ee7a8, #1f8f4d); }
+.pedal-brake { background: radial-gradient(circle at 35% 30%, #ff8b8b, #b3251f); width: 68px; height: 68px; align-self: flex-end; margin-bottom: 8px; }
+.pedal-nitro { background: radial-gradient(circle at 35% 30%, #7fd4ff, #1560a8); width: 60px; height: 60px; align-self: flex-start; margin-top: 8px; }
+
+.footer-note { position: absolute; bottom: 10px; font-size: 11px; color: #556; text-align: center; padding: 0 20px; }
+
+/* Landscape-only pedals layout tweak on very small screens */
+@media (max-width: 480px) and (orientation: landscape) {
+  .pedal-gas, .pedal-brake { transform: scale(0.9); }
+}
+
+/* ============ ADDITIONS for the complete build ============ */
+.hud-chip { background: #000a; padding: 2px 9px; border-radius: 6px; font-weight: 700; }
+.hud-fuel-row { display: flex; align-items: center; gap: 8px; max-width: 360px; }
+.leaderboard .you-tag { color: #f3d34a; font-size: 11px; }
+.overlay { overflow-y: auto; }
+
+.touch-controls { align-items: flex-end; }
+.tc-side { display: flex; align-items: flex-end; gap: 12px; pointer-events: none; }
+.tc-side .pedal { pointer-events: auto; margin: 0 !important; align-self: flex-end !important; }
+.pedal-tilt {
+  background: radial-gradient(circle at 35% 30%, #9aa3b8, #3a4258);
+  width: 56px; height: 56px; font-size: 20px;
+}
+.pedal { touch-action: none; }
+.pedal.pressed { transform: scale(0.92); filter: brightness(1.3); }
+.pedal-nitro.pressed { box-shadow: 0 0 16px #4fd6ff; }
+
+.countdown-num { font-size: clamp(70px, 18vw, 130px); }
+
+@media (max-width: 480px) and (orientation: landscape) {
+  .pedal-tilt { transform: scale(0.85); }
+  .hud { font-size: 12px; }
+  .pedal.pressed { transform: scale(0.85); }
+}
